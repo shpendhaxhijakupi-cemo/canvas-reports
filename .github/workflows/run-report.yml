@@ -1,0 +1,92 @@
+name: Run Canvas → Google Sheet Report
+
+on:
+  workflow_dispatch:
+    inputs:
+      student_ids:
+        description: "Comma-separated Canvas user IDs (e.g., 12345,67890)"
+        required: true
+      sheet_title:
+        description: "Google Sheet title to create/update"
+        required: true
+      airtable_record_id:
+        description: "(Optional) Airtable record ID to update after run"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: run-report-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Materialize secret files
+        run: |
+          # Google Service Account JSON (for gspread)
+          echo "${{ secrets.GS_SERVICE_ACCOUNT_JSON }}" > canvas-lms-448010-3eee3adf68cd.json
+          # Canvas OAuth tokens JSON used by your script (access + refresh)
+          echo "${{ secrets.CANVAS_TOKENS_JSON }}" > canvas_tokens.json
+
+      - name: Run Python report
+        id: runpy
+        env:
+          # Inputs (from dispatch)
+          STUDENT_IDS: ${{ github.event.inputs.student_ids }}
+          SHEET_TITLE: ${{ github.event.inputs.sheet_title }}
+
+          # Script config (prefer secrets over literals)
+          BASE_URL:     ${{ secrets.BASE_URL }}
+          REFRESH_URL:  ${{ secrets.REFRESH_URL }}
+          CLIENT_ID:    ${{ secrets.CLIENT_ID }}
+          CLIENT_SECRET:${{ secrets.CLIENT_SECRET }}
+          USER_EMAIL:   ${{ secrets.USER_EMAIL }}
+          # If you renamed the SA/Tokens files, set SERVICE_ACCOUNT_FILE/TOKEN_FILE here.
+
+        run: |
+          set -e
+          # Run and tee output so we can parse the Sheet URL
+          python main.py | tee run.log
+          # Extract the machine-friendly line printed by main.py: "SHEET_URL: https://..."
+          SHEET_URL=$(grep -Eo 'SHEET_URL:\s*https://[^ ]+' run.log | awk '{print $2}')
+          echo "SHEET_URL=$SHEET_URL" >> $GITHUB_OUTPUT
+          echo "Sheet URL detected: ${SHEET_URL:-<none>}"
+
+      - name: Update Airtable (optional)
+        if: ${{ github.event.inputs.airtable_record_id != '' }}
+        env:
+          AIRTABLE_BASE_ID:  ${{ secrets.AIRTABLE_BASE_ID }}
+          AIRTABLE_TABLE_ID: ${{ secrets.AIRTABLE_TABLE_ID }}   # e.g., tblUrAOHRXlbZEajl
+          AIRTABLE_PAT:      ${{ secrets.AIRTABLE_PAT }}        # Personal access token (fine-grained)
+          RECORD_ID:         ${{ github.event.inputs.airtable_record_id }}
+          SHEET_URL:         ${{ steps.runpy.outputs.SHEET_URL }}
+        run: |
+          set -e
+          NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          # Patch fields: "Report Last Run" (Date/Time) and "Sheet URL" (URL)
+          BODY=$(jq -n \
+            --arg now "$NOW" \
+            --arg url "${SHEET_URL:-}" \
+            '{fields: {"Report Last Run": $now, "Sheet URL": $url}}')
+          curl -sS -X PATCH \
+            "https://api.airtable.com/v0/${AIRTABLE_BASE_ID}/${AIRTABLE_TABLE_ID}/${RECORD_ID}" \
+            -H "Authorization: Bearer ${AIRTABLE_PAT}" \
+            -H "Content-Type: application/json" \
+            --data "$BODY"
