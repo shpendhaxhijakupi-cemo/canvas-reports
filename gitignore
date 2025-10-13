@@ -1,0 +1,9 @@
+# prevent accidental key commits
+*.json
+*.pem
+*.p12
+*.crt
+*.key
+.env
+__pycache__/
+*.pyc
