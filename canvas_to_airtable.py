@@ -1,6 +1,5 @@
 import os
 import time
-import json
 import requests
 from typing import Dict, List, Tuple
 from pyairtable import Api
@@ -10,13 +9,14 @@ from pyairtable import Api
 # ==============================
 BASE_URL = os.environ["CANVAS_API_URL"].rstrip("/")
 CANVAS_ACCESS_TOKEN = os.environ["CANVAS_ACCESS_TOKEN"]
+CANVAS_ACCOUNT_ID = os.environ.get("CANVAS_ACCOUNT_ID", "1")  # optional; used if you can read terms
 
 AIRTABLE_API_KEY = os.environ["AIRTABLE_API_KEY"]
 AIRTABLE_BASE_ID = os.environ["AIRTABLE_BASE_ID"]
 AIRTABLE_DETAILED_TABLE = os.environ.get("AIRTABLE_DETAILED_TABLE", "Phoenix Student Assignment Details")
 AIRTABLE_SUMMARY_TABLE  = os.environ.get("AIRTABLE_SUMMARY_TABLE",  "Phoenix Christian Course Details")
 
-# Logging toggles
+# Logging
 SHOW_FETCH_ASSIGNMENTS = True
 SHOW_FETCH_SUBMISSIONS = True
 SLEEP_BETWEEN_REQUESTS = float(os.environ.get("SLEEP_BETWEEN_REQUESTS", "0.0"))
@@ -48,11 +48,21 @@ def make_canvas_request(endpoint: str, params=None):
     return resp
 
 def get_terms() -> List[dict]:
-    data = make_canvas_request("accounts/1/terms").json()
-    return data.get("enrollment_terms", [])
+    """Try to fetch terms; return [] if not permitted (401/403)."""
+    try:
+        data = make_canvas_request(f"accounts/{CANVAS_ACCOUNT_ID}/terms").json()
+        return data.get("enrollment_terms", [])
+    except requests.exceptions.HTTPError as e:
+        if e.response is not None and e.response.status_code in (401, 403):
+            print("[WARN] No permission to read /accounts/*/terms; continuing without names.")
+            return []
+        raise
 
 def get_terms_map() -> Dict[int, str]:
-    return {t["id"]: t["name"] for t in get_terms()}
+    try:
+        return {t["id"]: t["name"] for t in get_terms()}
+    except Exception:
+        return {}
 
 def get_all_active_courses(user_id: str, term_id=None) -> List[dict]:
     states = ["active", "invited_or_pending", "completed", "inactive"]
@@ -142,8 +152,6 @@ def delete_existing_for_students(student_names: List[str]):
     """Delete existing rows for these students in both tables (idempotent runs)."""
     if not student_names:
         return
-    # Build OR({Student Name}="A", {Student Name}="B", ...)
-    # Escape quotes for formula
     def esc(n: str) -> str:
         return n.replace('"', r'\"')
     formula = "OR(" + ",".join([f'{{Student Name}} = "{esc(n)}"' for n in student_names]) + ")"
@@ -174,9 +182,12 @@ def main():
     stats = {"processed": 0, "skipped": 0}
     term_map = get_terms_map()
 
-    print("Terms discovered:")
-    for tid, tname in term_map.items():
-        print(f" - {tname} (ID: {tid})")
+    if term_map:
+        print("Terms discovered:")
+        for tid, tname in term_map.items():
+            print(f" - {tname} (ID: {tid})")
+    else:
+        print("[INFO] Proceeding without term names; will label as 'Term <id>'.")
 
     user_ids = input("Enter the student user IDs (comma-separated): ").strip().split(",")
     user_ids = [u.strip() for u in user_ids if u.strip()]
@@ -202,13 +213,14 @@ def main():
 
                 course_name = course.get("name", f"Course {cid}")
                 term_id = course.get("enrollment_term_id")
-                term_name = term_map.get(term_id, "Unknown Term")
+                # Fallback when we can't read terms: "Term <id>" or "Unknown Term"
+                term_name = term_map.get(term_id, f"Term {term_id}" if term_id else "Unknown Term")
 
                 assignments = get_all_assignments(cid, stats)
                 all_data[(term_name, course_name)] = [
                     {
                         "assignment_name": a["name"],
-                        "due_date": a.get("due_at"),  # ISO 8601 (Airtable Date field accepts ISO)
+                        "due_date": a.get("due_at"),  # ISO 8601
                         **get_submission(cid, a["id"], user_id),
                     }
                     for a in assignments
@@ -226,41 +238,4 @@ def main():
     for student_name, data in students_data.items():
         for (term_name, course_name), assignments in data["detailed_data"].items():
             total = len(assignments)
-            completed = sum(1 for a in assignments if a.get("submission_status") in ["graded", "excused"])
-            unsubmitted = total - completed
-            pct = (completed / total) if total > 0 else 0.0  # 0..1 range for Percent
-
-            for a in assignments:
-                detailed_rows.append({
-                    "Student Name": student_name,
-                    "Term Name": term_name,
-                    "Course Name": course_name,
-                    "Assignment Name": a.get("assignment_name", "N/A"),
-                    "Due Date": a.get("due_date") or None,
-                    "Submission Status": a.get("submission_status", "unsubmitted"),
-                    "Grade": a.get("grade", "N/A"),
-                })
-
-            summary_rows.append({
-                "Student Name": student_name,
-                "Term Name": term_name,
-                "Course Name": course_name,
-                "Total Assignments": total,
-                "Completed": completed,
-                "Unsubmitted": unsubmitted,
-                "Percentage Completed": pct,  # Airtable Percent type expects 0..1
-            })
-
-    # Idempotent write: clear existing rows for these students, then insert fresh rows
-    delete_existing_for_students(student_names_in_run)
-    airtable_insert_detailed(detailed_rows)
-    airtable_insert_summary(summary_rows)
-
-    print("\n=== Run Summary (All Terms) ===")
-    print(f"Assignments processed: {stats['processed']}")
-    print(f"Assignments skipped  : {stats['skipped']} (exact-title skips)")
-    print("===============================")
-
-
-if __name__ == "__main__":
-    main()
+            completed = sum(1 for a in assignments if a.get("submission_status")_
