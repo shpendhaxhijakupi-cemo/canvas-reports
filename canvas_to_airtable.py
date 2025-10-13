@@ -238,4 +238,41 @@ def main():
     for student_name, data in students_data.items():
         for (term_name, course_name), assignments in data["detailed_data"].items():
             total = len(assignments)
-            completed = sum(1 for a in assignments if a.get("submission_status")_
+            completed = sum(1 for a in assignments if a.get("submission_status") in ["graded", "excused"])
+            unsubmitted = total - completed
+            pct = (completed / total) if total > 0 else 0.0  # 0..1 for Percent
+
+            for a in assignments:
+                detailed_rows.append({
+                    "Student Name": student_name,
+                    "Term Name": term_name,
+                    "Course Name": course_name,
+                    "Assignment Name": a.get("assignment_name", "N/A"),
+                    "Due Date": a.get("due_date") or None,
+                    "Submission Status": a.get("submission_status", "unsubmitted"),
+                    "Grade": a.get("grade", "N/A"),
+                })
+
+            summary_rows.append({
+                "Student Name": student_name,
+                "Term Name": term_name,
+                "Course Name": course_name,
+                "Total Assignments": total,
+                "Completed": completed,
+                "Unsubmitted": unsubmitted,
+                "Percentage Completed": pct,  # Airtable Percent expects 0..1
+            })
+
+    # Idempotent write: clear existing rows for these students, then insert fresh rows
+    delete_existing_for_students(student_names_in_run)
+    airtable_insert_detailed(detailed_rows)
+    airtable_insert_summary(summary_rows)
+
+    print("\n=== Run Summary (All Terms) ===")
+    print(f"Assignments processed: {stats['processed']}")
+    print(f"Assignments skipped  : {stats['skipped']} (exact-title skips)")
+    print("===============================")
+
+
+if __name__ == "__main__":
+    main()
