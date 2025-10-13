@@ -1,3 +1,2 @@
 requests
-gspread
-google-auth
+pyairtable==2.3.3
