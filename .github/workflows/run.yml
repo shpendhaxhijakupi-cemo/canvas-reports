@@ -1,0 +1,42 @@
+name: Canvas → Airtable
+
+on:
+  workflow_dispatch:
+    inputs:
+      user_ids:
+        description: "Comma-separated Canvas user IDs"
+        required: true
+        default: "12345"
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run sync
+        env:
+          CANVAS_API_URL: ${{ secrets.CANVAS_API_URL }}
+          CANVAS_ACCESS_TOKEN: ${{ secrets.CANVAS_ACCESS_TOKEN }}
+
+          AIRTABLE_API_KEY: ${{ secrets.AIRTABLE_API_KEY }}
+          AIRTABLE_BASE_ID: ${{ secrets.AIRTABLE_BASE_ID }}
+
+          # stored as secrets in your repo (you already added them)
+          AIRTABLE_DETAILED_TABLE: ${{ secrets.AIRTABLE_DETAILED_TABLE }}
+          AIRTABLE_SUMMARY_TABLE:  ${{ secrets.AIRTABLE_SUMMARY_TABLE }}
+        run: |
+          python canvas_to_airtable.py << 'EOF'
+          ${{ github.event.inputs.user_ids }}
+          EOF
