@@ -305,6 +305,44 @@ def _validate_or_coerce_selects(rows: List[dict], table_def: dict, table_label: 
             if fname in r and r[fname] not in allowed:
                 r[fname] = fallback
 
+# ===== NEW: writable-field filtering (skip formula/rollup/lookup/etc.) =====
+def _writable_fieldnames(table_def: dict) -> set:
+    """
+    Return the set of field names that are writable via the API.
+    Skip computed/system fields like formula, rollup, lookup, createdTime, lastModifiedTime, autoNumber, button.
+    """
+    non_writable = {"formula", "rollup", "lookup", "createdTime", "lastModifiedTime", "autoNumber", "button"}
+    writable = set()
+    for f in table_def.get("fields", []):
+        ftype = f.get("type")
+        name = f.get("name")
+        if not name:
+            continue
+        if ftype in non_writable:
+            continue
+        # Link fields require record IDs; we aren't setting them, so skip
+        if ftype == "multipleRecordLinks":
+            continue
+        writable.add(name)
+    return writable
+
+def _filter_rows_to_writable(rows: List[dict], table_def: dict, label: str) -> List[dict]:
+    """Return copies of rows containing only writable fields for this table."""
+    if not table_def or not rows:
+        return rows
+    writable = _writable_fieldnames(table_def)
+    trimmed = [{k: v for k, v in r.items() if k in writable} for r in rows]
+    try:
+        for orig, new in zip(rows, trimmed):
+            if orig.keys() != new.keys():
+                removed = [k for k in orig.keys() if k not in new]
+                p(f"[INFO] {label}: dropping non-writable fields → {removed}")
+                break
+    except Exception:
+        pass
+    return trimmed
+# ===== END NEW =====
+
 def delete_existing_for_students(student_names: List[str]):
     if not student_names:
         p("[INFO] No students in run; nothing to delete.")
@@ -451,7 +489,7 @@ def main():
             total = len(assignments)
             completed = sum(1 for a in assignments if a.get("submission_status") in ["graded", "excused"])
             unsubmitted = total - completed
-            pct = (completed / total) if total > 0 else 0.0  # Airtable Percent expects 0..1
+            pct = (completed / total) if total > 0 else 0.0  # If you switch the Airtable field to 0-100, change to pct*100.
 
             for a in assignments:
                 detailed_rows.append({
@@ -471,13 +509,13 @@ def main():
                 "Total Assignments": total,
                 "Completed": completed,
                 "Unsubmitted": unsubmitted,
-                "Percentage Completed": pct,
+                "Percentage Completed": pct,  # If Airtable field is Formula/Rollup/Lookup, we will drop it below.
             })
 
     p(f"[INFO] Built {len(detailed_rows)} detailed rows; {len(summary_rows)} summary rows.")
     p(f"[INFO] Students in run: {len(students_data)} → {list(students_data.keys())[:5]}{'...' if len(students_data)>5 else ''}")
 
-    # ===== Schema check for single-selects (prevents 422 errors) =====
+    # ===== Schema check for single-selects =====
     p("[STEP] Fetching base schema…")
     schema = _fetch_base_schema()
     detailed_def = schema.get(AIRTABLE_DETAILED_TABLE_ID or AIRTABLE_DETAILED_TABLE)
@@ -487,6 +525,12 @@ def main():
     if summary_def:
         _validate_or_coerce_selects(summary_rows, summary_def, "Summary table")
     p("[STEP] Schema check finished.")
+
+    # ===== NEW: Drop non-writable fields so API writes don't 422 on formulas/rollups/lookups =====
+    if detailed_def:
+        detailed_rows = _filter_rows_to_writable(detailed_rows, detailed_def, "Detailed table")
+    if summary_def:
+        summary_rows  = _filter_rows_to_writable(summary_rows,  summary_def,  "Summary table")
 
     # Idempotent write
     p("[STEP] Deleting any prior rows for these students…")
