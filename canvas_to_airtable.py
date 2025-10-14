@@ -29,14 +29,12 @@ api = Api(AIRTABLE_API_KEY)
 tbl_detailed = api.table(AIRTABLE_BASE_ID, AIRTABLE_DETAILED_TABLE)
 tbl_summary  = api.table(AIRTABLE_BASE_ID, AIRTABLE_SUMMARY_TABLE)
 
-
 def is_skippable_assignment(a: dict) -> bool:
     name = (a.get("name") or "").strip().lower()
     return name in SKIP_EXACT_TITLES
 
-
 # ==============================
-# Canvas helpers (PAT)
+# Canvas helpers (PAT + masquerade)
 # ==============================
 def make_canvas_request(endpoint: str, params=None):
     if SLEEP_BETWEEN_REQUESTS:
@@ -64,13 +62,28 @@ def get_terms_map() -> Dict[int, str]:
     except Exception:
         return {}
 
-def get_all_active_courses(user_id: str, term_id=None) -> List[dict]:
+def get_user_profile_admin(user_id: str) -> dict:
+    """
+    Admin-friendly: use masquerade so we don't need direct /users/{id}.
+    Requires 'Become other users' permission (Account Admin typically has it).
+    """
+    return make_canvas_request("users/self/profile", params={"as_user_id": user_id}).json()
+
+def get_all_active_courses_admin(user_id: str, term_id=None) -> List[dict]:
+    """
+    Admin-friendly: list a user's courses using masquerade:
+    GET /users/self/courses?as_user_id=<id>
+    """
     states = ["active", "invited_or_pending", "completed", "inactive"]
     seen = set()
     all_courses: List[dict] = []
     for es in states:
-        endpoint = f"users/{user_id}/courses"
-        params = {"enrollment_state": es, "per_page": 100}
+        endpoint = "users/self/courses"
+        params = {
+            "as_user_id": user_id,
+            "enrollment_state": es,
+            "per_page": 100,
+        }
         while endpoint:
             resp = make_canvas_request(endpoint, params=params)
             data = resp.json()
@@ -123,7 +136,7 @@ def get_all_assignments(course_id: int, stats: dict) -> List[dict]:
 def get_submission(course_id: int, assignment_id: int, user_id: str) -> dict:
     try:
         if SHOW_FETCH_SUBMISSIONS:
-            print(f"Fetching submission for assignment {assignment_id} (course {course_id})")
+            print(f"Fetching submission for assignment {assignment_id} (course {course_id}) user {user_id}")
         sub = make_canvas_request(
             f"courses/{course_id}/assignments/{assignment_id}/submissions/{user_id}"
         ).json()
@@ -139,7 +152,6 @@ def get_submission(course_id: int, assignment_id: int, user_id: str) -> dict:
         if e.response.status_code == 404:
             return {"submission_status": "unsubmitted", "grade": "N/A"}
         raise
-
 
 # ==============================
 # Airtable helpers
@@ -174,7 +186,6 @@ def airtable_insert_summary(rows: List[dict]):
     for chunk in _chunks(rows, 10):
         tbl_summary.batch_create([{"fields": r} for r in chunk])
 
-
 # ==============================
 # Main
 # ==============================
@@ -197,11 +208,13 @@ def main():
 
     for user_id in user_ids:
         try:
-            profile = make_canvas_request(f"users/{user_id}/profile").json()
+            # Admin-safe profile via masquerade:
+            profile = get_user_profile_admin(user_id)
             student_name = profile.get("name", f"User {user_id}")
             student_names_in_run.append(student_name)
 
-            courses = get_all_active_courses(user_id, term_id=None)
+            # Admin-safe courses via masquerade:
+            courses = get_all_active_courses_admin(user_id, term_id=None)
             seen_courses = set()
             all_data: Dict[Tuple[str, str], List[dict]] = {}
 
@@ -213,7 +226,6 @@ def main():
 
                 course_name = course.get("name", f"Course {cid}")
                 term_id = course.get("enrollment_term_id")
-                # Fallback when we can't read terms: "Term <id>" or "Unknown Term"
                 term_name = term_map.get(term_id, f"Term {term_id}" if term_id else "Unknown Term")
 
                 assignments = get_all_assignments(cid, stats)
@@ -227,8 +239,13 @@ def main():
                 ]
 
             students_data[student_name] = {"detailed_data": all_data}
+        except requests.exceptions.HTTPError as e:
+            status = e.response.status_code if e.response is not None else "?"
+            print(f"[ERROR] User {user_id} failed with HTTP {status}. "
+                  f"Ensure your PAT is for an Account Admin with 'Masquerade' permission.")
+            continue
         except Exception as e:
-            print(f"Error processing user {user_id}: {e}")
+            print(f"[ERROR] Processing user {user_id}: {e}")
             continue
 
     # Transform to Airtable rows
@@ -264,7 +281,7 @@ def main():
             })
 
     # Idempotent write: clear existing rows for these students, then insert fresh rows
-    delete_existing_for_students(student_names_in_run)
+    delete_existing_for_students(list(students_data.keys()))
     airtable_insert_detailed(detailed_rows)
     airtable_insert_summary(summary_rows)
 
@@ -272,7 +289,6 @@ def main():
     print(f"Assignments processed: {stats['processed']}")
     print(f"Assignments skipped  : {stats['skipped']} (exact-title skips)")
     print("===============================")
-
 
 if __name__ == "__main__":
     main()
