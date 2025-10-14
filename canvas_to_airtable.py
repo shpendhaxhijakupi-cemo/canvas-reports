@@ -1,4 +1,5 @@
 import os
+import sys
 import time
 import requests
 import traceback
@@ -16,7 +17,7 @@ DEBUG = os.environ.get("DEBUG", "0") == "1"
 AIRTABLE_API_KEY = os.environ["AIRTABLE_API_KEY"]
 AIRTABLE_BASE_ID = os.environ["AIRTABLE_BASE_ID"]
 
-# Prefer table IDs if provided (safer); else use names
+# Prefer table IDs if provided; else use names
 AIRTABLE_DETAILED_TABLE_ID = os.environ.get("AIRTABLE_DETAILED_TABLE_ID")
 AIRTABLE_SUMMARY_TABLE_ID  = os.environ.get("AIRTABLE_SUMMARY_TABLE_ID")
 AIRTABLE_DETAILED_TABLE = os.environ.get("AIRTABLE_DETAILED_TABLE", "Phoenix Student Assignment Details")
@@ -30,8 +31,22 @@ SLEEP_BETWEEN_REQUESTS = float(os.environ.get("SLEEP_BETWEEN_REQUESTS", "0.0"))
 # Skip rules (exact-title)
 SKIP_EXACT_TITLES = {"end of unit feedback", "quarterly feedback"}
 
-# Optional tiny write probe after preflight (set to True to run)
+# Schema handling for select fields
+ALLOW_SELECT_FALLBACK = os.environ.get("ALLOW_SELECT_FALLBACK", "0") == "1"
+LOG_SCHEMA = os.environ.get("LOG_SCHEMA", "0") == "1"
+
+# Optional tiny write probe after preflight
 ENABLE_AIRTABLE_WRITE_PROBE = False
+
+# ==============================
+# tiny print helper (always flush)
+# ==============================
+def p(msg: str):
+    print(msg, flush=True)
+
+def dbg(msg: str):
+    if DEBUG:
+        p(f"[DEBUG] {msg}")
 
 # ==============================
 # Airtable clients
@@ -39,7 +54,6 @@ ENABLE_AIRTABLE_WRITE_PROBE = False
 api = Api(AIRTABLE_API_KEY)
 
 def _resolve_table(base_id: str, table_id: str | None, table_name: str):
-    """Return (Table, selector_str_for_logs)."""
     if table_id:
         return api.table(base_id, table_id), f"(table_id={table_id})"
     return api.table(base_id, table_name), f"(table_name='{table_name}')"
@@ -50,10 +64,6 @@ tbl_detailed, detailed_selector = _resolve_table(
 tbl_summary,  summary_selector  = _resolve_table(
     AIRTABLE_BASE_ID, AIRTABLE_SUMMARY_TABLE_ID,  AIRTABLE_SUMMARY_TABLE
 )
-
-def dbg(msg: str):
-    if DEBUG:
-        print(f"[DEBUG] {msg}")
 
 def is_skippable_assignment(a: dict) -> bool:
     name = (a.get("name") or "").strip().lower()
@@ -72,13 +82,12 @@ def make_canvas_request(endpoint: str, params=None):
     return resp
 
 def get_terms():
-    """Return list of enrollment terms or [] if you lack permission."""
     try:
         data = make_canvas_request(f"accounts/{CANVAS_ACCOUNT_ID}/terms").json()
         return data.get("enrollment_terms", [])
     except requests.exceptions.HTTPError as e:
         if e.response is not None and e.response.status_code in (401, 403):
-            print("[WARN] No permission to read /accounts/*/terms; continuing without names.")
+            p("[WARN] No permission to read /accounts/*/terms; continuing without names.")
             return []
         raise
 
@@ -89,11 +98,9 @@ def get_terms_map():
         return {}
 
 def get_user_profile_admin(user_id: str) -> dict:
-    """Admin-friendly via masquerade."""
     return make_canvas_request("users/self/profile", params={"as_user_id": user_id}).json()
 
 def get_all_active_courses_admin(user_id: str, term_id=None) -> List[dict]:
-    """Admin-friendly course list via masquerade."""
     states = ["active", "invited_or_pending", "completed", "inactive"]
     seen = set()
     all_courses: List[dict] = []
@@ -110,7 +117,6 @@ def get_all_active_courses_admin(user_id: str, term_id=None) -> List[dict]:
                 if cid and cid not in seen:
                     seen.add(cid)
                     all_courses.append(c)
-            # pagination
             links = resp.headers.get("Link", "")
             next_url = None
             for link in links.split(","):
@@ -137,7 +143,7 @@ def get_all_assignments(course_id: int, stats: dict) -> List[dict]:
                 stats["skipped"] += 1
                 continue
             if SHOW_FETCH_ASSIGNMENTS:
-                print(f"[KEEP] assignment {a.get('id')} '{a.get('name')}' course {course_id}")
+                p(f"[KEEP] assignment {a.get('id')} '{a.get('name')}' course {course_id}")
             out.append(a)
             stats["processed"] += 1
         # pagination
@@ -153,7 +159,7 @@ def get_all_assignments(course_id: int, stats: dict) -> List[dict]:
 def get_submission(course_id: int, assignment_id: int, user_id: str) -> dict:
     try:
         if SHOW_FETCH_SUBMISSIONS:
-            print(f"Fetching submission for assignment {assignment_id} (course {course_id}) user {user_id}")
+            p(f"Fetching submission for assignment {assignment_id} (course {course_id}) user {user_id}")
         sub = make_canvas_request(
             f"courses/{course_id}/assignments/{assignment_id}/submissions/{user_id}"
         ).json()
@@ -171,7 +177,7 @@ def get_submission(course_id: int, assignment_id: int, user_id: str) -> dict:
         raise
 
 # ==============================
-# Airtable helpers (retry + preflight)
+# Airtable helpers (retry + preflight + schema check)
 # ==============================
 def _chunks(lst, size):
     for i in range(0, len(lst), size):
@@ -187,8 +193,7 @@ def _status_from_exc(e):
     return None
 
 def _airtable_retry(fn, *args, **kwargs):
-    """Retry wrapper for Airtable rate limits/5xx with small backoff."""
-    delays = [0, 1, 2, 4]  # seconds
+    delays = [0, 1, 2, 4]
     last_exc = None
     for d in delays:
         try:
@@ -198,15 +203,15 @@ def _airtable_retry(fn, *args, **kwargs):
         except Exception as e:
             status = _status_from_exc(e)
             if status in (429, 500, 502, 503, 504):
-                print(f"[WARN] Airtable API {status}; retrying in {d}s...")
+                p(f"[WARN] Airtable API {status}; retrying in {d}s...")
                 last_exc = e
                 continue
-            print("[ERROR] Airtable call failed (no retry):")
+            p("[ERROR] Airtable call failed (no retry):")
             try:
-                print(repr(e))
+                p(repr(e))
                 resp = getattr(e, "response", None)
                 if resp is not None:
-                    print("Body:", getattr(resp, "text", "")[:2000])
+                    p("Body: " + getattr(resp, "text", "")[:2000])
             except Exception:
                 pass
             raise
@@ -214,36 +219,102 @@ def _airtable_retry(fn, *args, **kwargs):
         raise last_exc
 
 def _airtable_preflight():
-    print(f"[INFO] Airtable target: base={AIRTABLE_BASE_ID} detailed={detailed_selector} summary={summary_selector}")
-    # basic read check
+    p(f"[INFO] Airtable target: base={AIRTABLE_BASE_ID} detailed={detailed_selector} summary={summary_selector}")
     _airtable_retry(tbl_detailed.all, max_records=1)
     _airtable_retry(tbl_summary.all,  max_records=1)
-    print("[INFO] Airtable preflight OK (can read both tables).")
+    p("[INFO] Airtable preflight OK (can read both tables).")
 
 def _airtable_write_probe():
     if not ENABLE_AIRTABLE_WRITE_PROBE:
         return
-    print("[INFO] Airtable write probe: creating + deleting 1 record in the detailed table")
+    p("[INFO] Airtable write probe: creating + deleting 1 record in the detailed table")
     tmp = _airtable_retry(tbl_detailed.batch_create, [{"Student Name": "__probe__"}])
     try:
         rec_id = tmp[0]["id"] if isinstance(tmp, list) and tmp and isinstance(tmp[0], dict) else None
         if rec_id:
             _airtable_retry(tbl_detailed.batch_delete, [rec_id])
-        print("[INFO] Airtable write probe OK.")
+        p("[INFO] Airtable write probe OK.")
     except Exception:
-        print("[WARN] Probe create succeeded but cleanup failed; continuing")
+        p("[WARN] Probe create succeeded but cleanup failed; continuing")
+
+def _fetch_base_schema() -> Dict[str, dict]:
+    """Return {table_id: table_def} and {table_name: table_def} using Airtable schema API."""
+    url = f"https://api.airtable.com/v0/meta/bases/{AIRTABLE_BASE_ID}/tables"
+    headers = {"Authorization": f"Bearer {AIRTABLE_API_KEY}"}
+    resp = requests.get(url, headers=headers, timeout=60)
+    resp.raise_for_status()
+    data = resp.json()
+    out = {}
+    for t in data.get("tables", []):
+        out[t["id"]] = t
+        out[t["name"]] = t  # allow lookup by name too
+    return out
+
+def _single_select_options(table_def: dict):
+    """Return {field_name: [option names]} for singleSelect fields."""
+    opts = {}
+    for f in table_def.get("fields", []):
+        if f.get("type") == "singleSelect":
+            choices = [c.get("name") for c in (f.get("options", {}).get("choices") or []) if c.get("name")]
+            opts[f["name"]] = choices
+    return opts
+
+def _validate_or_coerce_selects(rows: List[dict], table_def: dict, table_label: str):
+    """Check singleSelect fields against options. Coerce if ALLOW_SELECT_FALLBACK else exit 1."""
+    if not rows:
+        return
+    options_map = _single_select_options(table_def)  # name -> choices list
+    if LOG_SCHEMA:
+        p(f"[SCHEMA] {table_label} select options: { {k: options_map[k][:10] for k in options_map} }")
+    if not options_map:
+        return
+
+    seen: Dict[str, set] = {fname: set() for fname in options_map.keys()}
+    for r in rows:
+        for fname in options_map.keys():
+            if fname in r and r[fname] is not None and r[fname] != "":
+                seen[fname].add(r[fname])
+
+    missing: Dict[str, List[str]] = {}
+    for fname, values in seen.items():
+        allowed = set(options_map.get(fname, []))
+        unknown = [v for v in values if v not in allowed]
+        if unknown:
+            missing[fname] = sorted(set(unknown))
+
+    if not missing:
+        p(f"[INFO] {table_label}: single select values OK.")
+        return
+
+    if not ALLOW_SELECT_FALLBACK:
+        p(f"[FATAL] {table_label}: missing single-select options detected:")
+        for fname, vals in missing.items():
+            p(f"       - Field '{fname}': add options → {vals[:20]}{' ...' if len(vals)>20 else ''}")
+        p("       Fix in Airtable (add these options or change field to 'Single line text'),")
+        p("       or set ALLOW_SELECT_FALLBACK=1 to coerce unknowns to an existing option.")
+        raise SystemExit(1)
+
+    # Coerce unknowns to 'Other' if present else first option
+    p(f"[WARN] {table_label}: coercing unknown single-select values (ALLOW_SELECT_FALLBACK=1).")
+    for fname, choices in options_map.items():
+        if not choices:
+            continue
+        fallback = "Other" if "Other" in choices else choices[0]
+        allowed = set(choices)
+        for r in rows:
+            if fname in r and r[fname] not in allowed:
+                r[fname] = fallback
 
 def delete_existing_for_students(student_names: List[str]):
-    """Delete existing rows for these students in both tables (idempotent runs)."""
     if not student_names:
-        print("[INFO] No students in run; nothing to delete.")
+        p("[INFO] No students in run; nothing to delete.")
         return
 
     def esc(n: str) -> str:
         return n.replace('"', r'\"')
 
     formula = "OR(" + ",".join([f'{{Student Name}} = "{esc(n)}"' for n in student_names]) + ")"
-    print(f"[INFO] Deleting existing rows for {len(student_names)} student(s)")
+    p(f"[INFO] Deleting existing rows for {len(student_names)} student(s)")
 
     def collect_ids(table, formula: str) -> List[str]:
         ids: List[str] = []
@@ -253,7 +324,6 @@ def delete_existing_for_students(student_names: List[str]):
                 if isinstance(r, dict) and r.get("id"):
                     ids.append(r["id"])
         except Exception:
-            # Fallback: iterate could yield pages
             for chunk in table.iterate(formula=formula):
                 if isinstance(chunk, dict) and chunk.get("id"):
                     ids.append(chunk["id"])
@@ -264,46 +334,44 @@ def delete_existing_for_students(student_names: List[str]):
         return ids
 
     det_ids = collect_ids(tbl_detailed, formula)
-    print(f"[INFO] Detailed: deleting {len(det_ids)} rows")
+    p(f"[INFO] Detailed: deleting {len(det_ids)} rows")
     for chunk in _chunks(det_ids, 50):
         _airtable_retry(tbl_detailed.batch_delete, chunk)
 
     sum_ids = collect_ids(tbl_summary, formula)
-    print(f"[INFO] Summary: deleting {len(sum_ids)} rows")
+    p(f"[INFO] Summary: deleting {len(sum_ids)} rows")
     for chunk in _chunks(sum_ids, 50):
         _airtable_retry(tbl_summary.batch_delete, chunk)
 
 def airtable_insert_detailed(rows: List[dict]):
-    print(f"[INFO] Inserting {len(rows)} detailed rows")
+    p(f"[INFO] Inserting {len(rows)} detailed rows")
     if not rows:
         return
     for i, chunk in enumerate(_chunks(rows, 10), start=1):
         try:
-            # pyairtable 2.x expects field dicts directly (no {"fields": ...})
-            _airtable_retry(tbl_detailed.batch_create, chunk)
+            _airtable_retry(tbl_detailed.batch_create, chunk)  # pyairtable 2.x
             dbg(f" detailed batch {i} ok ({len(chunk)})")
         except Exception:
-            print(f"[ERROR] detailed batch {i} failed, first record preview:")
+            p(f"[ERROR] detailed batch {i} failed, first record preview:")
             try:
-                print(chunk[0])
+                p(str(chunk[0]))
             except Exception:
                 pass
             traceback.print_exc()
             raise
 
 def airtable_insert_summary(rows: List[dict]):
-    print(f"[INFO] Inserting {len(rows)} summary rows")
+    p(f"[INFO] Inserting {len(rows)} summary rows")
     if not rows:
         return
     for i, chunk in enumerate(_chunks(rows, 10), start=1):
         try:
-            # pyairtable 2.x expects field dicts directly (no {"fields": ...})
-            _airtable_retry(tbl_summary.batch_create, chunk)
+            _airtable_retry(tbl_summary.batch_create, chunk)  # pyairtable 2.x
             dbg(f" summary batch {i} ok ({len(chunk)})")
         except Exception:
-            print(f"[ERROR] summary batch {i} failed, first record preview:")
+            p(f"[ERROR] summary batch {i} failed, first record preview:")
             try:
-                print(chunk[0])
+                p(str(chunk[0]))
             except Exception:
                 pass
             traceback.print_exc()
@@ -313,7 +381,8 @@ def airtable_insert_summary(rows: List[dict]):
 # Main
 # ==============================
 def main():
-    # Fail fast if Airtable is misconfigured
+    p("=== START canvas_to_airtable ===")
+
     _airtable_preflight()
     _airtable_write_probe()
 
@@ -321,11 +390,11 @@ def main():
     term_map = get_terms_map()
 
     if term_map:
-        print("Terms discovered:")
+        p("Terms discovered:")
         for tid, tname in term_map.items():
-            print(f" - {tname} (ID: {tid})")
+            p(f" - {tname} (ID: {tid})")
     else:
-        print("[INFO] Proceeding without term names; will label as 'Term <id>'.")
+        p("[INFO] Proceeding without term names; will label as 'Term <id>'.")
 
     user_ids = input("Enter the student user IDs (comma-separated): ").strip().split(",")
     user_ids = [u.strip() for u in user_ids if u.strip()]
@@ -356,6 +425,8 @@ def main():
                     {
                         "assignment_name": a["name"],
                         "due_date": a.get("due_at"),
+                        "Course Name": course_name,
+                        "Term Name": term_name,
                         **get_submission(cid, a["id"], user_id),
                     }
                     for a in assignments
@@ -364,10 +435,10 @@ def main():
             students_data[student_name] = {"detailed_data": all_data}
         except requests.exceptions.HTTPError as e:
             status = e.response.status_code if e.response is not None else "?"
-            print(f"[ERROR] User {user_id} failed with HTTP {status}. Ensure admin PAT with Masquerade.")
+            p(f"[ERROR] User {user_id} failed with HTTP {status}. Ensure admin PAT with Masquerade.")
             continue
         except Exception as e:
-            print(f"[ERROR] Processing user {user_id}: {e}")
+            p(f"[ERROR] Processing user {user_id}: {e}")
             traceback.print_exc()
             continue
 
@@ -403,23 +474,45 @@ def main():
                 "Percentage Completed": pct,
             })
 
-    print(f"[INFO] Built {len(detailed_rows)} detailed rows; {len(summary_rows)} summary rows.")
-    print(f"[INFO] Students in run: {len(students_data)} → {list(students_data.keys())[:5]}{'...' if len(students_data)>5 else ''}")
+    p(f"[INFO] Built {len(detailed_rows)} detailed rows; {len(summary_rows)} summary rows.")
+    p(f"[INFO] Students in run: {len(students_data)} → {list(students_data.keys())[:5]}{'...' if len(students_data)>5 else ''}")
+
+    # ===== Schema check for single-selects (prevents 422 errors) =====
+    p("[STEP] Fetching base schema…")
+    schema = _fetch_base_schema()
+    detailed_def = schema.get(AIRTABLE_DETAILED_TABLE_ID or AIRTABLE_DETAILED_TABLE)
+    summary_def  = schema.get(AIRTABLE_SUMMARY_TABLE_ID  or AIRTABLE_SUMMARY_TABLE)
+    if detailed_def:
+        _validate_or_coerce_selects(detailed_rows, detailed_def, "Detailed table")
+    if summary_def:
+        _validate_or_coerce_selects(summary_rows, summary_def, "Summary table")
+    p("[STEP] Schema check finished.")
 
     # Idempotent write
+    p("[STEP] Deleting any prior rows for these students…")
     delete_existing_for_students(list(students_data.keys()))
+    p("[STEP] Writing detailed rows…")
     airtable_insert_detailed(detailed_rows)
+    p("[STEP] Writing summary rows…")
     airtable_insert_summary(summary_rows)
 
-    print("\n=== Run Summary (All Terms) ===")
-    print(f"Assignments processed: {stats['processed']}")
-    print(f"Assignments skipped  : {stats['skipped']} (exact-title skips)")
-    print("===============================")
+    p("\n=== Run Summary (All Terms) ===")
+    p(f"Assignments processed: {stats['processed']}")
+    p(f"Assignments skipped  : {stats['skipped']} (exact-title skips)")
+    p("===============================")
 
 if __name__ == "__main__":
     try:
         main()
+        p("=== END OF SCRIPT (success) ===")
+    except SystemExit as e:
+        p(f"=== END OF SCRIPT (SystemExit code {e.code}) ===")
+        raise
+    except KeyboardInterrupt:
+        p("=== END OF SCRIPT (KeyboardInterrupt) ===")
+        raise
     except Exception:
-        print("\n[FATAL] Unhandled exception:")
+        p("\n[FATAL] Unhandled exception:")
         traceback.print_exc()
+        p("=== END OF SCRIPT (error) ===")
         raise
