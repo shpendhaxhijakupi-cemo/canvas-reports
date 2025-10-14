@@ -1,8 +1,10 @@
 import os
 import time
 import requests
+import traceback
 from typing import Dict, List, Tuple
 from pyairtable import Api
+from pyairtable.api.types import ApiError  # type: ignore
 
 # ==============================
 # Config from env (PAT method)
@@ -10,6 +12,7 @@ from pyairtable import Api
 BASE_URL = os.environ["CANVAS_API_URL"].rstrip("/")
 CANVAS_ACCESS_TOKEN = os.environ["CANVAS_ACCESS_TOKEN"]
 CANVAS_ACCOUNT_ID = os.environ.get("CANVAS_ACCOUNT_ID", "1")  # optional; used if you can read terms
+DEBUG = os.environ.get("DEBUG", "0") == "1"
 
 AIRTABLE_API_KEY = os.environ["AIRTABLE_API_KEY"]
 AIRTABLE_BASE_ID = os.environ["AIRTABLE_BASE_ID"]
@@ -28,6 +31,10 @@ SKIP_EXACT_TITLES = {"end of unit feedback", "quarterly feedback"}
 api = Api(AIRTABLE_API_KEY)
 tbl_detailed = api.table(AIRTABLE_BASE_ID, AIRTABLE_DETAILED_TABLE)
 tbl_summary  = api.table(AIRTABLE_BASE_ID, AIRTABLE_SUMMARY_TABLE)
+
+def dbg(msg: str):
+    if DEBUG:
+        print(f"[DEBUG] {msg}")
 
 def is_skippable_assignment(a: dict) -> bool:
     name = (a.get("name") or "").strip().lower()
@@ -148,30 +155,70 @@ def get_submission(course_id: int, assignment_id: int, user_id: str) -> dict:
         raise
 
 # ==============================
-# Airtable helpers
+# Airtable helpers (verbose + retry)
 # ==============================
 def _chunks(lst, size):
     for i in range(0, len(lst), size):
         yield lst[i:i+size]
 
+def _airtable_retry(fn, *args, **kwargs):
+    """Retry wrapper for Airtable rate limits/5xx with small backoff."""
+    delays = [0, 1, 2, 4]  # seconds
+    last_exc = None
+    for d in delays:
+        try:
+            if d:
+                time.sleep(d)
+            return fn(*args, **kwargs)
+        except ApiError as e:  # pyairtable error
+            status = getattr(e, "status", None) or getattr(e, "response", None) and getattr(e.response, "status_code", None)
+            if status and int(status) in (429, 500, 502, 503, 504):
+                print(f"[WARN] Airtable API {status}; retrying in {d}s...")
+                last_exc = e
+                continue
+            print("[ERROR] Airtable API error (no retry):")
+            try:
+                print(e)
+                if hasattr(e, "response") and e.response is not None:
+                    print("Body:", e.response.text[:2000])
+            except Exception:
+                pass
+            raise
+        except requests.exceptions.HTTPError as e:
+            status = e.response.status_code if e.response is not None else None
+            if status in (429, 500, 502, 503, 504):
+                print(f"[WARN] Airtable HTTP {status}; retrying in {d}s...")
+                last_exc = e
+                continue
+            print("[ERROR] Airtable HTTP error (no retry):")
+            print(repr(e))
+            if e.response is not None:
+                print("Body:", e.response.text[:2000])
+            raise
+    if last_exc:
+        raise last_exc
+
 def delete_existing_for_students(student_names: List[str]):
     """Delete existing rows for these students in both tables (idempotent runs)."""
     if not student_names:
+        print("[INFO] No students in run; nothing to delete.")
         return
 
     def esc(n: str) -> str:
         return n.replace('"', r'\"')
 
     formula = "OR(" + ",".join([f'{{Student Name}} = "{esc(n)}"' for n in student_names]) + ")"
+    print(f"[INFO] Deleting existing rows for {len(student_names)} student(s)")
 
     def collect_ids(table, formula: str) -> List[str]:
         ids: List[str] = []
         try:
-            # Prefer all(): returns a flat list of record dicts
-            records = table.all(formula=formula)
-            ids.extend(r.get("id") for r in records if isinstance(r, dict) and r.get("id"))
+            records = _airtable_retry(table.all, formula=formula) or []
+            for r in records:
+                if isinstance(r, dict) and r.get("id"):
+                    ids.append(r["id"])
         except Exception:
-            # Fallback: iterate() may yield pages (lists) or dicts depending on version
+            # Fallback: iterate() may yield pages (lists) or dicts
             for chunk in table.iterate(formula=formula):
                 if isinstance(chunk, dict):
                     rid = chunk.get("id")
@@ -184,24 +231,50 @@ def delete_existing_for_students(student_names: List[str]):
         return ids
 
     # Detailed table deletions
-    ids = collect_ids(tbl_detailed, formula)
-    for chunk in _chunks(ids, 50):
-        tbl_detailed.batch_delete(chunk)
+    det_ids = collect_ids(tbl_detailed, formula)
+    print(f"[INFO] Detailed: deleting {len(det_ids)} rows")
+    for chunk in _chunks(det_ids, 50):
+        _airtable_retry(tbl_detailed.batch_delete, chunk)
 
     # Summary table deletions
-    ids = collect_ids(tbl_summary, formula)
-    for chunk in _chunks(ids, 50):
-        tbl_summary.batch_delete(chunk)
+    sum_ids = collect_ids(tbl_summary, formula)
+    print(f"[INFO] Summary: deleting {len(sum_ids)} rows")
+    for chunk in _chunks(sum_ids, 50):
+        _airtable_retry(tbl_summary.batch_delete, chunk)
 
 def airtable_insert_detailed(rows: List[dict]):
-    if not rows: return
-    for chunk in _chunks(rows, 10):
-        tbl_detailed.batch_create([{"fields": r} for r in chunk])
+    print(f"[INFO] Inserting {len(rows)} detailed rows")
+    if not rows: 
+        return
+    for i, chunk in enumerate(_chunks(rows, 10), start=1):
+        try:
+            _airtable_retry(tbl_detailed.batch_create, [{"fields": r} for r in chunk])
+            dbg(f" detailed batch {i} ok ({len(chunk)})")
+        except Exception as e:
+            print(f"[ERROR] detailed batch {i} failed, first record preview:")
+            try:
+                print(chunk[0])
+            except Exception:
+                pass
+            traceback.print_exc()
+            raise
 
 def airtable_insert_summary(rows: List[dict]):
-    if not rows: return
-    for chunk in _chunks(rows, 10):
-        tbl_summary.batch_create([{"fields": r} for r in chunk])
+    print(f"[INFO] Inserting {len(rows)} summary rows")
+    if not rows: 
+        return
+    for i, chunk in enumerate(_chunks(rows, 10), start=1):
+        try:
+            _airtable_retry(tbl_summary.batch_create, [{"fields": r} for r in chunk])
+            dbg(f" summary batch {i} ok ({len(chunk)})")
+        except Exception as e:
+            print(f"[ERROR] summary batch {i} failed, first record preview:")
+            try:
+                print(chunk[0])
+            except Exception:
+                pass
+            traceback.print_exc()
+            raise
 
 # ==============================
 # Main
@@ -263,6 +336,7 @@ def main():
             continue
         except Exception as e:
             print(f"[ERROR] Processing user {user_id}: {e}")
+            traceback.print_exc()
             continue
 
     # Transform to Airtable rows
@@ -297,8 +371,11 @@ def main():
                 "Percentage Completed": pct,  # Airtable Percent expects 0..1
             })
 
+    print(f"[INFO] Built {len(detailed_rows)} detailed rows; {len(summary_rows)} summary rows.")
+    print(f"[INFO] Students in run: {len(students_data)} → {list(students_data.keys())[:5]}{'...' if len(students_data)>5 else ''}")
+
     # Idempotent write: clear existing rows for these students, then insert fresh rows
-    delete_existing_for_students(student_names_in_run)
+    delete_existing_for_students(list(students_data.keys()))
     airtable_insert_detailed(detailed_rows)
     airtable_insert_summary(summary_rows)
 
@@ -308,4 +385,9 @@ def main():
     print("===============================")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        print("\n[FATAL] Unhandled exception:")
+        traceback.print_exc()
+        raise
