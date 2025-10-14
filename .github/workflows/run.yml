@@ -1,81 +1,74 @@
-name: Canvas → Airtable
+name: Canvas → Airtable (All Partners)
 
 on:
   workflow_dispatch:
-    inputs:
-      student_ids:
-        description: "Comma-separated Canvas user IDs (e.g. 1643, 12345)"
-        required: true
-        type: string
+  schedule:
+    - cron: '0 3 * * *'  # daily 03:00 UTC
 
 jobs:
   sync:
     runs-on: ubuntu-latest
-
-    env:
-      # Make Python logs stream immediately
-      PYTHONUNBUFFERED: "1"
-      DEBUG: "1"
-      LOG_SCHEMA: "1"              # set to "0" to reduce noise
-      # Set to "1" if you want unknown single-select values coerced to "Other"/first option
-      ALLOW_SELECT_FALLBACK: "0"
-
-      # Canvas (secrets)
-      CANVAS_API_URL: ${{ secrets.CANVAS_API_URL }}
-      CANVAS_ACCESS_TOKEN: ${{ secrets.CANVAS_ACCESS_TOKEN }}
-      CANVAS_ACCOUNT_ID: ${{ secrets.CANVAS_ACCOUNT_ID }} # optional; defaults to 1 if not set
-
-      # Airtable (secrets)
-      AIRTABLE_API_KEY: ${{ secrets.AIRTABLE_API_KEY }}
-      AIRTABLE_BASE_ID: ${{ secrets.AIRTABLE_BASE_ID }}
-
-      # Prefer table IDs (tbl...) if you have them; names used only if IDs are missing
-      AIRTABLE_DETAILED_TABLE_ID: ${{ secrets.AIRTABLE_DETAILED_TABLE_ID }}
-      AIRTABLE_SUMMARY_TABLE_ID:  ${{ secrets.AIRTABLE_SUMMARY_TABLE_ID }}
-      AIRTABLE_DETAILED_TABLE:    ${{ secrets.AIRTABLE_DETAILED_TABLE }}   # e.g. Phoenix Student Assignment Details
-      AIRTABLE_SUMMARY_TABLE:     ${{ secrets.AIRTABLE_SUMMARY_TABLE }}    # e.g. Phoenix Christian Course Details
-
-      # Optional pacing
-      SLEEP_BETWEEN_REQUESTS: "0.0"
+    strategy:
+      fail-fast: false
+      matrix:
+        partner:
+          - name: phoenix
+            # Map your repo VARIABLES (vars) to what the script expects
+            env:
+              AIRTABLE_DETAILED_TABLE: ${{ vars.AIRTABLE_DETAILED_TABLE }}
+              AIRTABLE_SUMMARY_TABLE:  ${{ vars.AIRTABLE_SUMMARY_TABLE }}
+              STUDENT_USER_IDS:        ${{ vars.STUDENT_IDS_PHOENIX }}
+              PARTNER_NAME:            "Phoenix"
+          - name: nhcc
+            env:
+              AIRTABLE_DETAILED_TABLE: ${{ vars.AIRTABLE_DETAILED_NHCC_TABLE }}
+              AIRTABLE_SUMMARY_TABLE:  ${{ vars.AIRTABLE_SUMMARY_NHCC_TABLE }}
+              STUDENT_USER_IDS:        ${{ vars.STUDENT_IDS_NHCC }}
+              PARTNER_NAME:            "NHCC"
+          - name: b2c
+            env:
+              AIRTABLE_DETAILED_TABLE: ${{ vars.AIRTABLE_DETAILED_B2C_TABLE }}
+              AIRTABLE_SUMMARY_TABLE:  ${{ vars.AIRTABLE_SUMMARY_B2C_TABLE }}
+              STUDENT_USER_IDS:        ${{ vars.STUDENT_IDS_B2C }}
+              PARTNER_NAME:            "B2C"
+          - name: southlands
+            env:
+              AIRTABLE_DETAILED_TABLE: ${{ vars.AIRTABLE_DETAILED_SOUTHLANDS_TABLE }}
+              AIRTABLE_SUMMARY_TABLE:  ${{ vars.AIRTABLE_SUMMARY_SOUTHLANDS_TABLE }}
+              STUDENT_USER_IDS:        ${{ vars.STUDENT_IDS_SOUTHLANDS }}
+              PARTNER_NAME:            "Southlands"
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
-      - name: Install dependencies
+      - name: Install deps
         run: |
-          python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt || true
-          fi
-          # Ensure required libs are present (pyairtable v2.x + requests)
-          python - <<'PY'
-          import pkgutil, sys, subprocess
-          need = []
-          for mod in [("pyairtable", "pyairtable==2.*"), ("requests", "requests>=2.28")]:
-              if pkgutil.find_loader(mod[0]) is None:
-                  need.append(mod[1])
-          if need:
-              subprocess.check_call([sys.executable, "-m", "pip", "install", *need])
-          PY
+          pip install --upgrade pip
+          pip install requests pyairtable
 
-      - name: Show config targets (no secrets)
-        run: |
-          echo "Base: $AIRTABLE_BASE_ID"
-          echo "Detailed table selector: ${AIRTABLE_DETAILED_TABLE_ID:-$AIRTABLE_DETAILED_TABLE}"
-          echo "Summary  table selector: ${AIRTABLE_SUMMARY_TABLE_ID:-$AIRTABLE_SUMMARY_TABLE}"
-          echo "Canvas account id: ${CANVAS_ACCOUNT_ID:-1}"
-          echo "ALLOW_SELECT_FALLBACK=$ALLOW_SELECT_FALLBACK  LOG_SCHEMA=$LOG_SCHEMA  DEBUG=$DEBUG"
+      - name: Run sync for ${{ matrix.partner.name }}
+        env:
+          # Shared secrets (same for all partners)
+          CANVAS_API_URL:     ${{ secrets.CANVAS_API_URL }}
+          CANVAS_ACCESS_TOKEN:${{ secrets.CANVAS_ACCESS_TOKEN }}
+          AIRTABLE_API_KEY:   ${{ secrets.AIRTABLE_API_KEY }}
+          AIRTABLE_BASE_ID:   ${{ secrets.AIRTABLE_BASE_ID }}
 
-      - name: Run sync (Canvas → Airtable)
-        shell: bash
+          # Partner-specific (mapped above)
+          AIRTABLE_DETAILED_TABLE: ${{ matrix.partner.env.AIRTABLE_DETAILED_TABLE }}
+          AIRTABLE_SUMMARY_TABLE:  ${{ matrix.partner.env.AIRTABLE_SUMMARY_TABLE }}
+          STUDENT_USER_IDS:        ${{ matrix.partner.env.STUDENT_USER_IDS }}
+          PARTNER_NAME:            ${{ matrix.partner.env.PARTNER_NAME }}
+
+          # Optional tuning
+          DEBUG: "1"
+          LOG_SCHEMA: "1"
+          ALLOW_SELECT_FALLBACK: "0"   # set to "1" only if you keep single-selects that get new values
+          SLEEP_BETWEEN_REQUESTS: "0.0"
         run: |
-          set -euo pipefail
-          python canvas_to_airtable.py << 'EOF'
-          ${{ github.event.inputs.student_ids }}
-          EOF
+          export PYTHONUNBUFFERED=1
+          python canvas_to_airtable.py
