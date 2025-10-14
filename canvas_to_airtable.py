@@ -63,17 +63,11 @@ def get_terms_map() -> Dict[int, str]:
         return {}
 
 def get_user_profile_admin(user_id: str) -> dict:
-    """
-    Admin-friendly: use masquerade so we don't need direct /users/{id}.
-    Requires 'Become other users' permission (Account Admin typically has it).
-    """
+    """Admin-friendly: use masquerade to read another user's profile."""
     return make_canvas_request("users/self/profile", params={"as_user_id": user_id}).json()
 
 def get_all_active_courses_admin(user_id: str, term_id=None) -> List[dict]:
-    """
-    Admin-friendly: list a user's courses using masquerade:
-    GET /users/self/courses?as_user_id=<id>
-    """
+    """Admin-friendly: list a user's courses using masquerade (users/self/courses?as_user_id=...)."""
     states = ["active", "invited_or_pending", "completed", "inactive"]
     seen = set()
     all_courses: List[dict] = []
@@ -164,15 +158,38 @@ def delete_existing_for_students(student_names: List[str]):
     """Delete existing rows for these students in both tables (idempotent runs)."""
     if not student_names:
         return
+
     def esc(n: str) -> str:
         return n.replace('"', r'\"')
+
     formula = "OR(" + ",".join([f'{{Student Name}} = "{esc(n)}"' for n in student_names]) + ")"
 
-    ids = [rec["id"] for rec in tbl_detailed.iterate(formula=formula)]
+    def collect_ids(table, formula: str) -> List[str]:
+        ids: List[str] = []
+        try:
+            # Prefer all(): returns a flat list of record dicts
+            records = table.all(formula=formula)
+            ids.extend(r.get("id") for r in records if isinstance(r, dict) and r.get("id"))
+        except Exception:
+            # Fallback: iterate() may yield pages (lists) or dicts depending on version
+            for chunk in table.iterate(formula=formula):
+                if isinstance(chunk, dict):
+                    rid = chunk.get("id")
+                    if rid:
+                        ids.append(rid)
+                elif isinstance(chunk, list):
+                    for r in chunk:
+                        if isinstance(r, dict) and r.get("id"):
+                            ids.append(r["id"])
+        return ids
+
+    # Detailed table deletions
+    ids = collect_ids(tbl_detailed, formula)
     for chunk in _chunks(ids, 50):
         tbl_detailed.batch_delete(chunk)
 
-    ids = [rec["id"] for rec in tbl_summary.iterate(formula=formula)]
+    # Summary table deletions
+    ids = collect_ids(tbl_summary, formula)
     for chunk in _chunks(ids, 50):
         tbl_summary.batch_delete(chunk)
 
@@ -281,7 +298,7 @@ def main():
             })
 
     # Idempotent write: clear existing rows for these students, then insert fresh rows
-    delete_existing_for_students(list(students_data.keys()))
+    delete_existing_for_students(student_names_in_run)
     airtable_insert_detailed(detailed_rows)
     airtable_insert_summary(summary_rows)
 
