@@ -81,21 +81,39 @@ def make_canvas_request(endpoint: str, params=None):
     resp.raise_for_status()
     return resp
 
-def get_terms():
+# ---- Term name helpers (NEW: crawl all accounts to build a complete map) ----
+def _list_all_accounts() -> List[int]:
+    """Return a list of account IDs we can see (fallback to env account if /accounts is not allowed)."""
     try:
-        data = make_canvas_request(f"accounts/{CANVAS_ACCOUNT_ID}/terms").json()
-        return data.get("enrollment_terms", [])
+        accs = make_canvas_request("accounts").json()
+        ids = [a["id"] for a in accs if isinstance(a, dict) and "id" in a]
+        if not ids:
+            return [int(CANVAS_ACCOUNT_ID)]
+        return ids
     except requests.exceptions.HTTPError as e:
+        # If forbidden, just use the configured account
         if e.response is not None and e.response.status_code in (401, 403):
-            p("[WARN] No permission to read /accounts/*/terms; continuing without names.")
-            return []
+            p("[WARN] No permission to list /accounts; using CANVAS_ACCOUNT_ID only.")
+            return [int(CANVAS_ACCOUNT_ID)]
         raise
 
-def get_terms_map():
+def _terms_for_account(acc_id: int) -> Dict[int, str]:
     try:
-        return {t["id"]: t["name"] for t in get_terms()}
-    except Exception:
-        return {}
+        data = make_canvas_request(f"accounts/{acc_id}/terms").json()
+        return {t["id"]: t["name"] for t in data.get("enrollment_terms", []) if "id" in t and "name" in t}
+    except requests.exceptions.HTTPError as e:
+        if e.response is not None and e.response.status_code in (401, 403):
+            dbg(f"No permission to read /accounts/{acc_id}/terms")
+            return {}
+        raise
+
+def get_terms_map_union() -> Dict[int, str]:
+    """Build a union of enrollment_term_id → name across all accessible accounts."""
+    ids = _list_all_accounts()
+    combined: Dict[int, str] = {}
+    for aid in ids:
+        combined.update(_terms_for_account(aid))
+    return combined
 
 def get_user_profile_admin(user_id: str) -> dict:
     return make_canvas_request("users/self/profile", params={"as_user_id": user_id}).json()
@@ -305,12 +323,8 @@ def _validate_or_coerce_selects(rows: List[dict], table_def: dict, table_label: 
             if fname in r and r[fname] not in allowed:
                 r[fname] = fallback
 
-# ===== NEW: writable-field filtering (skip formula/rollup/lookup/etc.) =====
+# ===== Writable-field filtering (skip formula/rollup/lookup/etc.) =====
 def _writable_fieldnames(table_def: dict) -> set:
-    """
-    Return the set of field names that are writable via the API.
-    Skip computed/system fields like formula, rollup, lookup, createdTime, lastModifiedTime, autoNumber, button.
-    """
     non_writable = {"formula", "rollup", "lookup", "createdTime", "lastModifiedTime", "autoNumber", "button"}
     writable = set()
     for f in table_def.get("fields", []):
@@ -320,14 +334,12 @@ def _writable_fieldnames(table_def: dict) -> set:
             continue
         if ftype in non_writable:
             continue
-        # Link fields require record IDs; we aren't setting them, so skip
         if ftype == "multipleRecordLinks":
             continue
         writable.add(name)
     return writable
 
 def _filter_rows_to_writable(rows: List[dict], table_def: dict, label: str) -> List[dict]:
-    """Return copies of rows containing only writable fields for this table."""
     if not table_def or not rows:
         return rows
     writable = _writable_fieldnames(table_def)
@@ -341,7 +353,25 @@ def _filter_rows_to_writable(rows: List[dict], table_def: dict, label: str) -> L
     except Exception:
         pass
     return trimmed
-# ===== END NEW =====
+
+# (Optional) single-line-text percent coercion helper, if you ever need it again.
+def _field_type(table_def: dict, field_name: str) -> str | None:
+    for f in table_def.get("fields", []):
+        if f.get("name") == field_name:
+            return f.get("type")
+    return None
+
+def _coerce_percentage_for_schema(rows: List[dict], table_def: dict, field_name: str):
+    if not rows or not table_def:
+        return
+    ftype = _field_type(table_def, field_name)
+    if not ftype:
+        return
+    if ftype == "singleLineText":
+        for r in rows:
+            v = r.get(field_name, None)
+            if isinstance(v, (int, float)):
+                r[field_name] = f"{v*100:.2f}%"
 
 def delete_existing_for_students(student_names: List[str]):
     if not student_names:
@@ -425,14 +455,15 @@ def main():
     _airtable_write_probe()
 
     stats = {"processed": 0, "skipped": 0}
-    term_map = get_terms_map()
 
+    # NEW: build a union term map from all accessible accounts
+    term_map = get_terms_map_union()
     if term_map:
-        p("Terms discovered:")
+        p("Terms discovered (union across accounts):")
         for tid, tname in term_map.items():
             p(f" - {tname} (ID: {tid})")
     else:
-        p("[INFO] Proceeding without term names; will label as 'Term <id>'.")
+        p("[WARN] No term names available; will label as 'Term <id>' if needed.")
 
     user_ids = input("Enter the student user IDs (comma-separated): ").strip().split(",")
     user_ids = [u.strip() for u in user_ids if u.strip()]
@@ -456,6 +487,7 @@ def main():
 
                 course_name = course.get("name", f"Course {cid}")
                 term_id = course.get("enrollment_term_id")
+                # >>> use real term name if we have it <<<
                 term_name = term_map.get(term_id, f"Term {term_id}" if term_id else "Unknown Term")
 
                 assignments = get_all_assignments(cid, stats)
@@ -489,12 +521,12 @@ def main():
             total = len(assignments)
             completed = sum(1 for a in assignments if a.get("submission_status") in ["graded", "excused"])
             unsubmitted = total - completed
-            pct = (completed / total) if total > 0 else 0.0  # If you switch the Airtable field to 0-100, change to pct*100.
+            pct = (completed / total) if total > 0 else 0.0  # If switching to 0-100 in Airtable, send pct*100.
 
             for a in assignments:
                 detailed_rows.append({
                     "Student Name": student_name,
-                    "Term Name": term_name,
+                    "Term Name": term_name,           # already a real name if available
                     "Course Name": course_name,
                     "Assignment Name": a.get("assignment_name", "N/A"),
                     "Due Date": a.get("due_date") or None,
@@ -504,12 +536,12 @@ def main():
 
             summary_rows.append({
                 "Student Name": student_name,
-                "Term Name": term_name,
+                "Term Name": term_name,             # already a real name if available
                 "Course Name": course_name,
                 "Total Assignments": total,
                 "Completed": completed,
                 "Unsubmitted": unsubmitted,
-                "Percentage Completed": pct,  # If Airtable field is Formula/Rollup/Lookup, we will drop it below.
+                "Percentage Completed": pct,        # may be dropped later if non-writable
             })
 
     p(f"[INFO] Built {len(detailed_rows)} detailed rows; {len(summary_rows)} summary rows.")
@@ -526,7 +558,11 @@ def main():
         _validate_or_coerce_selects(summary_rows, summary_def, "Summary table")
     p("[STEP] Schema check finished.")
 
-    # ===== NEW: Drop non-writable fields so API writes don't 422 on formulas/rollups/lookups =====
+    # Optional: if Summary["Percentage Completed"] is singleLineText, format as "xx.xx%"
+    if summary_def:
+        _coerce_percentage_for_schema(summary_rows, summary_def, "Percentage Completed")
+
+    # Drop non-writable fields (formula/rollup/lookup) so API writes don't 422
     if detailed_def:
         detailed_rows = _filter_rows_to_writable(detailed_rows, detailed_def, "Detailed table")
     if summary_def:
