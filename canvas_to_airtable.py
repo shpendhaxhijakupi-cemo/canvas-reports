@@ -4,7 +4,6 @@ import requests
 import traceback
 from typing import Dict, List, Tuple
 from pyairtable import Api
-from pyairtable.api.types import ApiError  # type: ignore
 
 # ==============================
 # Config from env (PAT method)
@@ -161,6 +160,15 @@ def _chunks(lst, size):
     for i in range(0, len(lst), size):
         yield lst[i:i+size]
 
+def _status_from_exc(e):
+    try:
+        resp = getattr(e, "response", None)
+        if resp is not None and hasattr(resp, "status_code"):
+            return int(resp.status_code)
+    except Exception:
+        pass
+    return None
+
 def _airtable_retry(fn, *args, **kwargs):
     """Retry wrapper for Airtable rate limits/5xx with small backoff."""
     delays = [0, 1, 2, 4]  # seconds
@@ -170,30 +178,20 @@ def _airtable_retry(fn, *args, **kwargs):
             if d:
                 time.sleep(d)
             return fn(*args, **kwargs)
-        except ApiError as e:  # pyairtable error
-            status = getattr(e, "status", None) or getattr(e, "response", None) and getattr(e.response, "status_code", None)
-            if status and int(status) in (429, 500, 502, 503, 504):
+        except Exception as e:
+            status = _status_from_exc(e)
+            if status in (429, 500, 502, 503, 504):
                 print(f"[WARN] Airtable API {status}; retrying in {d}s...")
                 last_exc = e
                 continue
-            print("[ERROR] Airtable API error (no retry):")
+            print("[ERROR] Airtable call failed (no retry):")
             try:
-                print(e)
-                if hasattr(e, "response") and e.response is not None:
-                    print("Body:", e.response.text[:2000])
+                print(repr(e))
+                resp = getattr(e, "response", None)
+                if resp is not None:
+                    print("Body:", getattr(resp, "text", "")[:2000])
             except Exception:
                 pass
-            raise
-        except requests.exceptions.HTTPError as e:
-            status = e.response.status_code if e.response is not None else None
-            if status in (429, 500, 502, 503, 504):
-                print(f"[WARN] Airtable HTTP {status}; retrying in {d}s...")
-                last_exc = e
-                continue
-            print("[ERROR] Airtable HTTP error (no retry):")
-            print(repr(e))
-            if e.response is not None:
-                print("Body:", e.response.text[:2000])
             raise
     if last_exc:
         raise last_exc
@@ -244,13 +242,13 @@ def delete_existing_for_students(student_names: List[str]):
 
 def airtable_insert_detailed(rows: List[dict]):
     print(f"[INFO] Inserting {len(rows)} detailed rows")
-    if not rows: 
+    if not rows:
         return
     for i, chunk in enumerate(_chunks(rows, 10), start=1):
         try:
             _airtable_retry(tbl_detailed.batch_create, [{"fields": r} for r in chunk])
             dbg(f" detailed batch {i} ok ({len(chunk)})")
-        except Exception as e:
+        except Exception:
             print(f"[ERROR] detailed batch {i} failed, first record preview:")
             try:
                 print(chunk[0])
@@ -261,13 +259,13 @@ def airtable_insert_detailed(rows: List[dict]):
 
 def airtable_insert_summary(rows: List[dict]):
     print(f"[INFO] Inserting {len(rows)} summary rows")
-    if not rows: 
+    if not rows:
         return
     for i, chunk in enumerate(_chunks(rows, 10), start=1):
         try:
             _airtable_retry(tbl_summary.batch_create, [{"fields": r} for r in chunk])
             dbg(f" summary batch {i} ok ({len(chunk)})")
-        except Exception as e:
+        except Exception:
             print(f"[ERROR] summary batch {i} failed, first record preview:")
             try:
                 print(chunk[0])
