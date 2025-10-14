@@ -1,5 +1,4 @@
 import os
-import sys
 import time
 import requests
 import traceback
@@ -7,12 +6,12 @@ from typing import Dict, List, Tuple, Optional
 from pyairtable import Api
 
 # ==============================
-# Config from env
+# Env / Config
 # ==============================
 BASE_URL = os.environ["CANVAS_API_URL"].rstrip("/")
 CANVAS_ACCESS_TOKEN = os.environ["CANVAS_ACCESS_TOKEN"]
+# CANVAS_ACCOUNT_ID no longer used for term lookup, but keep for completeness
 CANVAS_ACCOUNT_ID = os.environ.get("CANVAS_ACCOUNT_ID", "1")
-DEBUG = os.environ.get("DEBUG", "0") == "1"
 
 AIRTABLE_API_KEY = os.environ["AIRTABLE_API_KEY"]
 AIRTABLE_BASE_ID = os.environ["AIRTABLE_BASE_ID"]
@@ -23,30 +22,27 @@ AIRTABLE_SUMMARY_TABLE_ID  = os.environ.get("AIRTABLE_SUMMARY_TABLE_ID")
 AIRTABLE_DETAILED_TABLE = os.environ.get("AIRTABLE_DETAILED_TABLE", "Phoenix Student Assignment Details")
 AIRTABLE_SUMMARY_TABLE  = os.environ.get("AIRTABLE_SUMMARY_TABLE",  "Phoenix Christian Course Details")
 
-# Logging / pacing
-SHOW_FETCH_ASSIGNMENTS = True
-SHOW_FETCH_SUBMISSIONS = True
+DEBUG = os.environ.get("DEBUG", "0") == "1"
+LOG_SCHEMA = os.environ.get("LOG_SCHEMA", "0") == "1"
+ALLOW_SELECT_FALLBACK = os.environ.get("ALLOW_SELECT_FALLBACK", "0") == "1"
 SLEEP_BETWEEN_REQUESTS = float(os.environ.get("SLEEP_BETWEEN_REQUESTS", "0.0"))
 
-# Skip rules (exact-title)
-SKIP_EXACT_TITLES = {"end of unit feedback", "quarterly feedback"}
-
-# Schema handling for select fields
-ALLOW_SELECT_FALLBACK = os.environ.get("ALLOW_SELECT_FALLBACK", "0") == "1"
-LOG_SCHEMA = os.environ.get("LOG_SCHEMA", "0") == "1"
-
-# Optional write probe
+SHOW_FETCH_ASSIGNMENTS = True
+SHOW_FETCH_SUBMISSIONS = True
 ENABLE_AIRTABLE_WRITE_PROBE = False
 
+# Exact-title skips
+SKIP_EXACT_TITLES = {"end of unit feedback", "quarterly feedback"}
+
 # ==============================
-# tiny print helpers
+# Print helpers
 # ==============================
 def p(msg: str): print(msg, flush=True)
 def dbg(msg: str):
     if DEBUG: p(f"[DEBUG] {msg}")
 
 # ==============================
-# Airtable clients
+# Airtable setup
 # ==============================
 api = Api(AIRTABLE_API_KEY)
 
@@ -57,10 +53,6 @@ def _resolve_table(base_id: str, table_id: Optional[str], table_name: str):
 
 tbl_detailed, detailed_selector = _resolve_table(AIRTABLE_BASE_ID, AIRTABLE_DETAILED_TABLE_ID, AIRTABLE_DETAILED_TABLE)
 tbl_summary,  summary_selector  = _resolve_table(AIRTABLE_BASE_ID, AIRTABLE_SUMMARY_TABLE_ID,  AIRTABLE_SUMMARY_TABLE)
-
-def is_skippable_assignment(a: dict) -> bool:
-    name = (a.get("name") or "").strip().lower()
-    return name in SKIP_EXACT_TITLES
 
 # ==============================
 # Canvas helpers (PAT + masquerade)
@@ -74,31 +66,19 @@ def make_canvas_request(endpoint: str, params=None):
     resp.raise_for_status()
     return resp
 
-def get_terms_map_safe() -> Dict[int, str]:
-    """Try only the configured account; if not permitted, return {} (we'll use course.term.name anyway)."""
-    try:
-        data = make_canvas_request(f"accounts/{CANVAS_ACCOUNT_ID}/terms").json()
-        return {t["id"]: t["name"] for t in data.get("enrollment_terms", []) if "id" in t and "name" in t}
-    except requests.exceptions.HTTPError as e:
-        if e.response is not None and e.response.status_code in (400, 401, 403):
-            p("[WARN] Cannot read account terms for configured account; relying on course.term include.")
-            return {}
-        raise
-
 def get_user_profile_admin(user_id: str) -> dict:
     return make_canvas_request("users/self/profile", params={"as_user_id": user_id}).json()
 
 def get_all_active_courses_admin(user_id: str, term_id=None) -> List[dict]:
     """
-    Ask Canvas to include the term object with each course (include[]=term),
-    so we can use course['term']['name'] directly without calling /accounts/*/terms.
+    Include term object with each course so we can use course['term']['name']
+    and avoid /accounts/*/terms entirely.
     """
     states = ["active", "invited_or_pending", "completed", "inactive"]
     seen = set()
-    all_courses: List[dict] = []
+    courses: List[dict] = []
     for es in states:
         endpoint = "users/self/courses"
-        # include[]=term returns {"term": {"id": ..., "name": ...}}
         params = {"as_user_id": user_id, "enrollment_state": es, "per_page": 100, "include[]": "term"}
         while endpoint:
             resp = make_canvas_request(endpoint, params=params)
@@ -109,7 +89,7 @@ def get_all_active_courses_admin(user_id: str, term_id=None) -> List[dict]:
                 cid = c.get("id")
                 if cid and cid not in seen:
                     seen.add(cid)
-                    all_courses.append(c)
+                    courses.append(c)
             # pagination
             links = resp.headers.get("Link", "")
             next_url = None
@@ -122,7 +102,7 @@ def get_all_active_courses_admin(user_id: str, term_id=None) -> List[dict]:
                 params = None
             else:
                 endpoint = None
-    return all_courses
+    return courses
 
 def get_all_assignments(course_id: int, stats: dict) -> List[dict]:
     out = []
@@ -133,14 +113,14 @@ def get_all_assignments(course_id: int, stats: dict) -> List[dict]:
         for a in data:
             if not a.get("published"):
                 continue
-            if is_skippable_assignment(a):
+            name_norm = (a.get("name") or "").strip().lower()
+            if name_norm in SKIP_EXACT_TITLES:
                 stats["skipped"] += 1
                 continue
             if SHOW_FETCH_ASSIGNMENTS:
                 p(f"[KEEP] assignment {a.get('id')} '{a.get('name')}' course {course_id}")
             out.append(a)
             stats["processed"] += 1
-        # pagination
         links = resp.headers.get("Link", "")
         next_url = None
         for link in links.split(","):
@@ -159,8 +139,7 @@ def get_submission(course_id: int, assignment_id: int, user_id: str) -> dict:
         ).json()
         state = sub.get("workflow_state", "unsubmitted")
         grade = sub.get("grade", "N/A")
-        excused = sub.get("excused", False)
-        if excused:
+        if sub.get("excused", False):
             return {"submission_status": "excused", "grade": "Excused"}
         if state in ["graded", "submitted"] and grade not in [None, "-", ""]:
             return {"submission_status": "graded", "grade": grade}
@@ -171,7 +150,7 @@ def get_submission(course_id: int, assignment_id: int, user_id: str) -> dict:
         raise
 
 # ==============================
-# Airtable helpers (retry + preflight + schema check)
+# Airtable helpers (retry + schema)
 # ==============================
 def _chunks(lst, size):
     for i in range(0, len(lst), size):
@@ -191,7 +170,8 @@ def _airtable_retry(fn, *args, **kwargs):
     last_exc = None
     for d in delays:
         try:
-            if d: time.sleep(d)
+            if d:
+                time.sleep(d)
             return fn(*args, **kwargs)
         except Exception as e:
             status = _status_from_exc(e)
@@ -218,12 +198,14 @@ def _airtable_preflight():
     p("[INFO] Airtable preflight OK (can read both tables).")
 
 def _airtable_write_probe():
-    if not ENABLE_AIRTABLE_WRITE_PROBE: return
+    if not ENABLE_AIRTABLE_WRITE_PROBE:
+        return
     p("[INFO] Airtable write probe: creating + deleting 1 record in the detailed table")
     tmp = _airtable_retry(tbl_detailed.batch_create, [{"Student Name": "__probe__"}])
     try:
         rec_id = tmp[0]["id"] if isinstance(tmp, list) and tmp and isinstance(tmp[0], dict) else None
-        if rec_id: _airtable_retry(tbl_detailed.batch_delete, [rec_id])
+        if rec_id:
+            _airtable_retry(tbl_detailed.batch_delete, [rec_id])
         p("[INFO] Airtable write probe OK.")
     except Exception:
         p("[WARN] Probe create succeeded but cleanup failed; continuing")
@@ -250,29 +232,27 @@ def _single_select_options(table_def: dict):
     return opts
 
 def _validate_or_coerce_selects(rows: List[dict], table_def: dict, table_label: str):
-    if not rows: return
+    if not rows:
+        return
     options_map = _single_select_options(table_def)
     if LOG_SCHEMA:
-        p(f"[SCHEMA] {table_label} select options: { {k: options_map[k][:10] for k in options_map} }")
-    if not options_map: return
-
+        p(f"[SCHEMA] {table_label} select options: {{k: options_map[k][:10] for k in options_map}}")
+    if not options_map:
+        return
     seen: Dict[str, set] = {fname: set() for fname in options_map.keys()}
     for r in rows:
         for fname in options_map.keys():
             if fname in r and r[fname] not in (None, ""):
                 seen[fname].add(r[fname])
-
     missing: Dict[str, List[str]] = {}
     for fname, values in seen.items():
         allowed = set(options_map.get(fname, []))
         unknown = [v for v in values if v not in allowed]
         if unknown:
             missing[fname] = sorted(set(unknown))
-
     if not missing:
         p(f"[INFO] {table_label}: single select values OK.")
         return
-
     if not ALLOW_SELECT_FALLBACK:
         p(f"[FATAL] {table_label}: missing single-select options detected:")
         for fname, vals in missing.items():
@@ -280,31 +260,35 @@ def _validate_or_coerce_selects(rows: List[dict], table_def: dict, table_label: 
         p("       Fix in Airtable (add these options or change field to 'Single line text'),")
         p("       or set ALLOW_SELECT_FALLBACK=1 to coerce unknowns to an existing option.")
         raise SystemExit(1)
-
     p(f"[WARN] {table_label}: coercing unknown single-select values (ALLOW_SELECT_FALLBACK=1).")
     for fname, choices in options_map.items():
-        if not choices: continue
+        if not choices:
+            continue
         fallback = "Other" if "Other" in choices else choices[0]
         allowed = set(choices)
         for r in rows:
             if fname in r and r[fname] not in allowed:
                 r[fname] = fallback
 
-# ===== Writable-field filtering =====
+# Writable-field filtering
 def _writable_fieldnames(table_def: dict) -> set:
     non_writable = {"formula", "rollup", "lookup", "createdTime", "lastModifiedTime", "autoNumber", "button"}
     writable = set()
     for f in table_def.get("fields", []):
         ftype = f.get("type")
         name = f.get("name")
-        if not name: continue
-        if ftype in non_writable: continue
-        if ftype == "multipleRecordLinks": continue
+        if not name:
+            continue
+        if ftype in non_writable:
+            continue
+        if ftype == "multipleRecordLinks":
+            continue
         writable.add(name)
     return writable
 
 def _filter_rows_to_writable(rows: List[dict], table_def: dict, label: str) -> List[dict]:
-    if not table_def or not rows: return rows
+    if not table_def or not rows:
+        return rows
     writable = _writable_fieldnames(table_def)
     trimmed = [{k: v for k, v in r.items() if k in writable} for r in rows]
     try:
@@ -317,7 +301,7 @@ def _filter_rows_to_writable(rows: List[dict], table_def: dict, label: str) -> L
         pass
     return trimmed
 
-# (Optional) coerce % to text if field is singleLineText
+# Percent coercion helper (if Airtable field is singleLineText)
 def _field_type(table_def: dict, field_name: str) -> Optional[str]:
     for f in table_def.get("fields", []):
         if f.get("name") == field_name:
@@ -325,15 +309,20 @@ def _field_type(table_def: dict, field_name: str) -> Optional[str]:
     return None
 
 def _coerce_percentage_for_schema(rows: List[dict], table_def: dict, field_name: str):
-    if not rows or not table_def: return
+    if not rows or not table_def:
+        return
     ftype = _field_type(table_def, field_name)
-    if not ftype: return
+    if not ftype:
+        return
     if ftype == "singleLineText":
         for r in rows:
             v = r.get(field_name, None)
             if isinstance(v, (int, float)):
                 r[field_name] = f"{v*100:.2f}%"
 
+# ==============================
+# CRUD helpers
+# ==============================
 def delete_existing_for_students(student_names: List[str]):
     if not student_names:
         p("[INFO] No students in run; nothing to delete.")
@@ -372,10 +361,11 @@ def delete_existing_for_students(student_names: List[str]):
 
 def airtable_insert_detailed(rows: List[dict]):
     p(f"[INFO] Inserting {len(rows)} detailed rows")
-    if not rows: return
+    if not rows:
+        return
     for i, chunk in enumerate(_chunks(rows, 10), start=1):
         try:
-            _airtable_retry(tbl_detailed.batch_create, chunk)
+            _airtable_retry(tbl_detailed.batch_create, chunk)  # pyairtable 2.x expects list[dict[field->value]]
             dbg(f" detailed batch {i} ok ({len(chunk)})")
         except Exception:
             p(f"[ERROR] detailed batch {i} failed, first record preview:")
@@ -386,7 +376,8 @@ def airtable_insert_detailed(rows: List[dict]):
 
 def airtable_insert_summary(rows: List[dict]):
     p(f"[INFO] Inserting {len(rows)} summary rows")
-    if not rows: return
+    if not rows:
+        return
     for i, chunk in enumerate(_chunks(rows, 10), start=1):
         try:
             _airtable_retry(tbl_summary.batch_create, chunk)
@@ -408,14 +399,8 @@ def main():
 
     stats = {"processed": 0, "skipped": 0}
 
-    # Best-effort map (not required anymore, we use course.term.name)
-    term_map = get_terms_map_safe()
-    if term_map:
-        p("Terms discovered (from configured account):")
-        for tid, tname in term_map.items():
-            p(f" - {tname} (ID: {tid})")
-    else:
-        p("[INFO] Proceeding without global term listing; using course.term.name from Canvas.")
+    # We no longer fetch global terms; rely on course.term.name
+    p("[INFO] Skipping global terms lookup; using course.term.name from Canvas.")
 
     user_ids = input("Enter the student user IDs (comma-separated): ").strip().split(",")
     user_ids = [u.strip() for u in user_ids if u.strip()]
@@ -438,11 +423,9 @@ def main():
                 seen_courses.add(cid)
 
                 course_name = course.get("name", f"Course {cid}")
-
-                # Prefer the included term name
                 term_obj = course.get("term") or {}
                 term_id = course.get("enrollment_term_id")
-                term_name = term_obj.get("name") or term_map.get(term_id, f"Term {term_id}" if term_id else "Unknown Term")
+                term_name = term_obj.get("name") or (f"Term {term_id}" if term_id else "Unknown Term")
 
                 assignments = get_all_assignments(cid, stats)
                 all_data[(term_name, course_name)] = [
@@ -450,7 +433,7 @@ def main():
                         "assignment_name": a["name"],
                         "due_date": a.get("due_at"),
                         "Course Name": course_name,
-                        "Term Name": term_name,   # real name here
+                        "Term Name": term_name,  # real term name here
                         **get_submission(cid, a["id"], user_id),
                     }
                     for a in assignments
@@ -475,7 +458,7 @@ def main():
             total = len(assignments)
             completed = sum(1 for a in assignments if a.get("submission_status") in ["graded", "excused"])
             unsubmitted = total - completed
-            pct = (completed / total) if total > 0 else 0.0  # if Airtable expects 0-100, change to pct*100
+            pct = (completed / total) if total > 0 else 0.0  # if your Airtable field expects 0-100, send pct*100
 
             for a in assignments:
                 detailed_rows.append({
@@ -495,13 +478,13 @@ def main():
                 "Total Assignments": total,
                 "Completed": completed,
                 "Unsubmitted": unsubmitted,
-                "Percentage Completed": pct,  # may be coerced/dropped below
+                "Percentage Completed": pct,  # may be coerced to text below
             })
 
     p(f"[INFO] Built {len(detailed_rows)} detailed rows; {len(summary_rows)} summary rows.")
     p(f"[INFO] Students in run: {len(students_data)} → {list(students_data.keys())[:5]}{'...' if len(students_data)>5 else ''}")
 
-    # ===== Schema check for single-selects =====
+    # ===== Schema check for select fields =====
     p("[STEP] Fetching base schema…")
     schema = _fetch_base_schema()
     detailed_def = schema.get(AIRTABLE_DETAILED_TABLE_ID or AIRTABLE_DETAILED_TABLE)
@@ -512,11 +495,11 @@ def main():
         _validate_or_coerce_selects(summary_rows, summary_def, "Summary table")
     p("[STEP] Schema check finished.")
 
-    # If Percentage Completed is singleLineText, convert to "xx.xx%" strings
+    # If "Percentage Completed" is single line text, format as "xx.xx%"
     if summary_def:
         _coerce_percentage_for_schema(summary_rows, summary_def, "Percentage Completed")
 
-    # Drop non-writable fields (formula/rollup/lookup) to avoid 422
+    # Drop non-writable fields (formula/rollup/lookup/link) to avoid 422s
     if detailed_def:
         detailed_rows = _filter_rows_to_writable(detailed_rows, detailed_def, "Detailed table")
     if summary_def:
@@ -537,6 +520,7 @@ def main():
 
 if __name__ == "__main__":
     try:
+        p("=== START canvas_to_airtable ===")
         main()
         p("=== END OF SCRIPT (success) ===")
     except SystemExit as e:
