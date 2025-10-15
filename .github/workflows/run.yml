@@ -1,9 +1,9 @@
-name: Canvas to Airtable (All Partners)
+name: Canvas → Airtable (All Partners)
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 3 * * *'  # daily 03:00 UTC
+    - cron: '0 3 * * *'
 
 jobs:
   sync:
@@ -14,27 +14,30 @@ jobs:
         partner:
           - name: phoenix
             env:
-              AIRTABLE_DETAILED_TABLE: ${{ vars.AIRTABLE_DETAILED_TABLE }}
-              AIRTABLE_SUMMARY_TABLE:  ${{ vars.AIRTABLE_SUMMARY_TABLE }}
-              STUDENT_USER_IDS:        ${{ vars.STUDENT_IDS_PHOENIX }}
+              AIRTABLE_DETAILED_TABLE: ${{ secrets.AIRTABLE_DETAILED_TABLE }}
+              AIRTABLE_SUMMARY_TABLE:  ${{ secrets.AIRTABLE_SUMMARY_TABLE }}
+              STUDENT_USER_IDS:        ${{ secrets.STUDENT_IDS_PHOENIX }}
               PARTNER_NAME:            "Phoenix"
+
           - name: nhcc
             env:
-              AIRTABLE_DETAILED_TABLE: ${{ vars.AIRTABLE_DETAILED_NHCC_TABLE }}
-              AIRTABLE_SUMMARY_TABLE:  ${{ vars.AIRTABLE_SUMMARY_NHCC_TABLE }}
-              STUDENT_USER_IDS:        ${{ vars.STUDENT_IDS_NHCC }}
+              AIRTABLE_DETAILED_TABLE: ${{ secrets.AIRTABLE_DETAILED_NHCC_TABLE }}
+              AIRTABLE_SUMMARY_TABLE:  ${{ secrets.AIRTABLE_SUMMARY_NHCC_TABLE }}
+              STUDENT_USER_IDS:        ${{ secrets.STUDENT_IDS_NHCC }}
               PARTNER_NAME:            "NHCC"
+
           - name: b2c
             env:
-              AIRTABLE_DETAILED_TABLE: ${{ vars.AIRTABLE_DETAILED_B2C_TABLE }}
-              AIRTABLE_SUMMARY_TABLE:  ${{ vars.AIRTABLE_SUMMARY_B2C_TABLE }}
-              STUDENT_USER_IDS:        ${{ vars.STUDENT_IDS_B2C }}
+              AIRTABLE_DETAILED_TABLE: ${{ secrets.AIRTABLE_DETAILED_B2C_TABLE }}
+              AIRTABLE_SUMMARY_TABLE:  ${{ secrets.AIRTABLE_SUMMARY_B2C_TABLE }}
+              STUDENT_USER_IDS:        ${{ secrets.STUDENT_IDS_B2C }}
               PARTNER_NAME:            "B2C"
+
           - name: southlands
             env:
-              AIRTABLE_DETAILED_TABLE: ${{ vars.AIRTABLE_DETAILED_SOUTHLANDS_TABLE }}
-              AIRTABLE_SUMMARY_TABLE:  ${{ vars.AIRTABLE_SUMMARY_SOUTHLANDS_TABLE }}
-              STUDENT_USER_IDS:        ${{ vars.STUDENT_IDS_SOUTHLANDS }}
+              AIRTABLE_DETAILED_TABLE: ${{ secrets.AIRTABLE_DETAILED_SOUTHLANDS_TABLE }}
+              AIRTABLE_SUMMARY_TABLE:  ${{ secrets.AIRTABLE_SUMMARY_SOUTHLANDS_TABLE }}
+              STUDENT_USER_IDS:        ${{ secrets.STUDENT_IDS_SOUTHLANDS }}
               PARTNER_NAME:            "Southlands"
 
     steps:
@@ -49,6 +52,18 @@ jobs:
           pip install --upgrade pip
           pip install requests pyairtable
 
+      - name: Validate partner env
+        shell: bash
+        env:
+          D_NM:  ${{ matrix.partner.env.AIRTABLE_DETAILED_TABLE }}
+          S_NM:  ${{ matrix.partner.env.AIRTABLE_SUMMARY_TABLE }}
+          SIDS:  ${{ matrix.partner.env.STUDENT_USER_IDS }}
+        run: |
+          echo "Detailed(Name)='${D_NM}'  Summary(Name)='${S_NM}'  Student IDs='${SIDS}'"
+          if [ -z "${SIDS}" ]; then echo "::error ::STUDENT_USER_IDS is empty"; exit 1; fi
+          if [ -z "${D_NM}" ];  then echo "::error ::AIRTABLE_DETAILED_TABLE is empty"; exit 1; fi
+          if [ -z "${S_NM}" ];  then echo "::error ::AIRTABLE_SUMMARY_TABLE is empty"; exit 1; fi
+
       - name: Run sync for ${{ matrix.partner.name }}
         env:
           # Shared secrets
@@ -57,17 +72,16 @@ jobs:
           AIRTABLE_API_KEY:    ${{ secrets.AIRTABLE_API_KEY }}
           AIRTABLE_BASE_ID:    ${{ secrets.AIRTABLE_BASE_ID }}
 
-          # Partner-specific (mapped from matrix above)
+          # Partner-specific (from matrix)
           AIRTABLE_DETAILED_TABLE: ${{ matrix.partner.env.AIRTABLE_DETAILED_TABLE }}
           AIRTABLE_SUMMARY_TABLE:  ${{ matrix.partner.env.AIRTABLE_SUMMARY_TABLE }}
           STUDENT_USER_IDS:        ${{ matrix.partner.env.STUDENT_USER_IDS }}
           PARTNER_NAME:            ${{ matrix.partner.env.PARTNER_NAME }}
 
-          # Optional tuning
+          # Optional
           DEBUG: "1"
           LOG_SCHEMA: "1"
           ALLOW_SELECT_FALLBACK: "0"
-          SLEEP_BETWEEN_REQUESTS: "0.0"
         run: |
           export PYTHONUNBUFFERED=1
           python canvas_to_airtable.py
