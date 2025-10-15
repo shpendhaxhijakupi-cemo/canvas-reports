@@ -3,6 +3,7 @@ import time
 import requests
 import traceback
 from typing import Dict, List, Tuple, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pyairtable import Api
 
 # ==============================
@@ -10,8 +11,7 @@ from pyairtable import Api
 # ==============================
 BASE_URL = os.environ["CANVAS_API_URL"].rstrip("/")
 CANVAS_ACCESS_TOKEN = os.environ["CANVAS_ACCESS_TOKEN"]
-# kept for completeness (not used for term lookup)
-CANVAS_ACCOUNT_ID = os.environ.get("CANVAS_ACCOUNT_ID", "1")
+CANVAS_ACCOUNT_ID = os.environ.get("CANVAS_ACCOUNT_ID", "1")  # not used for term lookup now
 
 AIRTABLE_API_KEY = os.environ["AIRTABLE_API_KEY"]
 AIRTABLE_BASE_ID = os.environ["AIRTABLE_BASE_ID"]
@@ -22,20 +22,16 @@ AIRTABLE_SUMMARY_TABLE_ID  = os.environ.get("AIRTABLE_SUMMARY_TABLE_ID")
 AIRTABLE_DETAILED_TABLE = os.environ.get("AIRTABLE_DETAILED_TABLE", "Phoenix Student Assignment Details")
 AIRTABLE_SUMMARY_TABLE  = os.environ.get("AIRTABLE_SUMMARY_TABLE",  "Phoenix Christian Course Details")
 
-# Optional run-time flags
+# Students list comes from env; supports comma or space separated
+STUDENT_USER_IDS = os.environ.get("STUDENT_USER_IDS", "")
+
 DEBUG = os.environ.get("DEBUG", "0") == "1"
 LOG_SCHEMA = os.environ.get("LOG_SCHEMA", "0") == "1"
 ALLOW_SELECT_FALLBACK = os.environ.get("ALLOW_SELECT_FALLBACK", "0") == "1"
 SLEEP_BETWEEN_REQUESTS = float(os.environ.get("SLEEP_BETWEEN_REQUESTS", "0.0"))
 
-# NEW: wipe-all mode (delete everything in both tables first)
-WIPE_TABLES_FIRST = os.environ.get("WIPE_TABLES", "1") == "1"
-
-# If provided, use comma-separated Canvas user IDs instead of prompting
-STUDENT_USER_IDS_ENV = os.environ.get("STUDENT_USER_IDS", "")
-
-# NEW: per-student delete match field (default "Student Name")
-STUDENT_MATCH_FIELD = os.environ.get("STUDENT_MATCH_FIELD", "Student Name")
+# parallel delete workers for wipe
+WIPE_CONCURRENCY = int(os.environ.get("WIPE_CONCURRENCY", "4"))
 
 SHOW_FETCH_ASSIGNMENTS = True
 SHOW_FETCH_SUBMISSIONS = True
@@ -77,7 +73,6 @@ def make_canvas_request(endpoint: str, params=None):
     return resp
 
 def get_user_profile_admin(user_id: str) -> dict:
-    # Masquerade as the user via as_user_id
     return make_canvas_request("users/self/profile", params={"as_user_id": user_id}).json()
 
 def get_all_active_courses_admin(user_id: str, term_id=None) -> List[dict]:
@@ -161,7 +156,7 @@ def get_submission(course_id: int, assignment_id: int, user_id: str) -> dict:
         raise
 
 # ==============================
-# Airtable helpers (retry + schema + wipe)
+# Airtable helpers (retry + schema)
 # ==============================
 def _chunks(lst, size):
     for i in range(0, len(lst), size):
@@ -217,29 +212,9 @@ def _airtable_write_probe():
         rec_id = tmp[0]["id"] if isinstance(tmp, list) and tmp and isinstance(tmp[0], dict) else None
         if rec_id:
             _airtable_retry(tbl_detailed.batch_delete, [rec_id])
-        p("[INFO] Airtable write probe OK.]")
+        p("[INFO] Airtable write probe OK.")
     except Exception:
         p("[WARN] Probe create succeeded but cleanup failed; continuing")
-
-def _delete_all_records(table, label: str):
-    """Delete ALL records from a table in batches."""
-    p(f"[WIPE] Deleting ALL records from {label}…")
-    batch = []
-    deleted_total = 0
-    for page in table.iterate(page_size=100):
-        records = page if isinstance(page, list) else [page]
-        for r in records:
-            rid = r.get("id") if isinstance(r, dict) else None
-            if rid:
-                batch.append(rid)
-            if len(batch) == 50:
-                _airtable_retry(table.batch_delete, batch)
-                deleted_total += len(batch)
-                batch = []
-    if batch:
-        _airtable_retry(table.batch_delete, batch)
-        deleted_total += len(batch)
-    p(f"[WIPE] {label}: deleted {deleted_total} records.")
 
 def _fetch_base_schema() -> Dict[str, dict]:
     """Return {table_id: table_def} and {table_name: table_def} using Airtable schema API."""
@@ -270,11 +245,11 @@ def _validate_or_coerce_selects(rows: List[dict], table_def: dict, table_label: 
         p(f"[SCHEMA] {table_label} select options: {{k: options_map[k][:10] for k in options_map}}")
     if not options_map:
         return
-    seen: Dict[str, set] = {fname: set() for fname in options_map.keys() if fname in rows[0]}
+    seen: Dict[str, set] = {fname: set() for fname in options_map.keys()}
     for r in rows:
         for fname in options_map.keys():
             if fname in r and r[fname] not in (None, ""):
-                seen.setdefault(fname, set()).add(r[fname])
+                seen[fname].add(r[fname])
     missing: Dict[str, List[str]] = {}
     for fname, values in seen.items():
         allowed = set(options_map.get(fname, []))
@@ -351,70 +326,61 @@ def _coerce_percentage_for_schema(rows: List[dict], table_def: dict, field_name:
             if isinstance(v, (int, float)):
                 r[field_name] = f"{v*100:.2f}%"
 
-def _table_has_field(table_def: Optional[dict], field_name: str) -> bool:
-    if not table_def:
-        return False
-    for f in table_def.get("fields", []):
-        if f.get("name") == field_name:
-            return True
-    return False
+# ==============================
+# Fast full-table wipe (parallel)
+# ==============================
+def _delete_all_records(table, label: str):
+    """Delete ALL records from a table quickly:
+       - gather all IDs
+       - delete in chunks of 50
+       - run several batch_delete calls in parallel (with retries/backoff)
+    """
+    p(f"[WIPE] Collecting all record IDs from {label}…")
+    record_ids: List[str] = []
+    for page in table.iterate(page_size=100):
+        records = page if isinstance(page, list) else [page]
+        for r in records:
+            rid = r.get("id") if isinstance(r, dict) else None
+            if rid:
+                record_ids.append(rid)
 
-# ==============================
-# CRUD helpers
-# ==============================
-def delete_existing_for_students(student_names: List[str], detailed_def: Optional[dict], summary_def: Optional[dict]):
-    """
-    Delete existing rows for Student Name(s) if the match field exists.
-    """
-    if not student_names:
-        p("[INFO] No students in run; nothing to delete.")
+    if not record_ids:
+        p(f"[WIPE] {label}: nothing to delete.")
         return
 
-    # Ensure the match field exists on each table (avoid INVALID_FILTER_BY_FORMULA).
-    det_ok = _table_has_field(detailed_def, STUDENT_MATCH_FIELD)
-    sum_ok = _table_has_field(summary_def,  STUDENT_MATCH_FIELD)
+    chunks = [record_ids[i:i+50] for i in range(0, len(record_ids), 50)]
+    p(f"[WIPE] {label}: deleting {len(record_ids)} records in {len(chunks)} batches of ≤50 (concurrency={WIPE_CONCURRENCY})…")
 
-    if not det_ok and not sum_ok:
-        p(f"[WARN] Match field '{STUDENT_MATCH_FIELD}' not found on either table; skipping per-student delete.")
-        return
+    deleted = 0
+    errors = 0
 
-    def esc(n: str) -> str: return n.replace('"', r'\"')
-    formula = "OR(" + ",".join([f'{{{STUDENT_MATCH_FIELD}}} = "{esc(n)}"' for n in student_names]) + ")"
-    p(f"[INFO] Deleting existing rows for {len(student_names)} student(s) using field '{STUDENT_MATCH_FIELD}'")
+    def _delete_chunk(ids):
+        _airtable_retry(table.batch_delete, ids)
+        return len(ids)
 
-    def collect_ids(table, formula: str) -> List[str]:
-        ids: List[str] = []
-        try:
-            records = _airtable_retry(table.all, formula=formula) or []
-            for r in records:
-                if isinstance(r, dict) and r.get("id"):
-                    ids.append(r["id"])
-        except Exception:
-            for chunk in table.iterate(formula=formula):
-                if isinstance(chunk, dict) and chunk.get("id"):
-                    ids.append(chunk["id"])
-                elif isinstance(chunk, list):
-                    for r in chunk:
-                        if isinstance(r, dict) and r.get("id"):
-                            ids.append(r["id"])
-        return ids
+    with ThreadPoolExecutor(max_workers=WIPE_CONCURRENCY) as ex:
+        futures = [ex.submit(_delete_chunk, c) for c in chunks]
+        for fut in as_completed(futures):
+            try:
+                deleted += fut.result()
+            except Exception:
+                errors += 1
+                traceback.print_exc()
 
-    if det_ok:
-        det_ids = collect_ids(tbl_detailed, formula)
-        p(f"[INFO] Detailed: deleting {len(det_ids)} rows")
-        for chunk in _chunks(det_ids, 50):
-            _airtable_retry(tbl_detailed.batch_delete, chunk)
+    if errors:
+        p(f"[WIPE] {label}: finished with {errors} failed batch(es) and {deleted} deleted IDs.")
+        raise SystemExit(1)
     else:
-        p(f"[WARN] Detailed table missing field '{STUDENT_MATCH_FIELD}'; skipping per-student delete for detailed.")
+        p(f"[WIPE] {label}: finished — deleted {deleted} records.")
 
-    if sum_ok:
-        sum_ids = collect_ids(tbl_summary, formula)
-        p(f"[INFO] Summary: deleting {len(sum_ids)} rows")
-        for chunk in _chunks(sum_ids, 50):
-            _airtable_retry(tbl_summary.batch_delete, chunk)
-    else:
-        p(f"[WARN] Summary table missing field '{STUDENT_MATCH_FIELD}'; skipping per-student delete for summary.")
+def wipe_both_tables():
+    p("[STEP] Wiping Airtable tables (full truncate via parallel batch deletes)…")
+    _delete_all_records(tbl_detailed, "Detailed table")
+    _delete_all_records(tbl_summary,  "Summary table")
 
+# ==============================
+# CRUD helpers (insert only)
+# ==============================
 def airtable_insert_detailed(rows: List[dict]):
     p(f"[INFO] Inserting {len(rows)} detailed rows")
     if not rows:
@@ -448,28 +414,34 @@ def airtable_insert_summary(rows: List[dict]):
 # ==============================
 # Main
 # ==============================
+def _parse_student_ids(env_value: str) -> List[str]:
+    # allow comma or whitespace separated
+    tokens = [t.strip() for t in env_value.replace(",", " ").split() if t.strip()]
+    # de-dupe, keep order
+    seen = set()
+    out = []
+    for t in tokens:
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
+
 def main():
     p("=== START canvas_to_airtable ===")
     _airtable_preflight()
     _airtable_write_probe()
 
-    # NEW: wipe-all mode (before any fetch/write)
-    if WIPE_TABLES_FIRST:
-        _delete_all_records(tbl_detailed, "Detailed table")
-        _delete_all_records(tbl_summary,  "Summary table")
+    # Always wipe both tables first (fast, parallel)
+    wipe_both_tables()
 
     stats = {"processed": 0, "skipped": 0}
 
-    # Rely on course.term.name from Canvas.
+    # We no longer fetch global terms; rely on course.term.name
     p("[INFO] Skipping global terms lookup; using course.term.name from Canvas.")
 
-    # Prefer non-interactive input via env; fallback to prompt
-    if STUDENT_USER_IDS_ENV.strip():
-        user_ids = [u.strip() for u in STUDENT_USER_IDS_ENV.split(",") if u.strip()]
-        p(f"[INFO] Using STUDENT_USER_IDS from env: {len(user_ids)} id(s).")
-    else:
-        user_ids = input("Enter the student user IDs (comma-separated): ").strip().split(",")
-        user_ids = [u.strip() for u in user_ids if u.strip()]
+    user_ids = _parse_student_ids(STUDENT_USER_IDS)
+    if not user_ids:
+        raise SystemExit("STUDENT_USER_IDS env is empty. Provide one or more Canvas user IDs.")
 
     students_data = {}
 
@@ -524,7 +496,7 @@ def main():
             total = len(assignments)
             completed = sum(1 for a in assignments if a.get("submission_status") in ["graded", "excused"])
             unsubmitted = total - completed
-            pct = (completed / total) if total > 0 else 0.0  # 0..1; may be coerced to "xx.xx%" below
+            pct = (completed / total) if total > 0 else 0.0  # 0..1
 
             for a in assignments:
                 detailed_rows.append({
@@ -571,13 +543,7 @@ def main():
     if summary_def:
         summary_rows  = _filter_rows_to_writable(summary_rows,  summary_def,  "Summary table")
 
-    # Idempotent write
-    if not WIPE_TABLES_FIRST:
-        p("[STEP] Deleting any prior rows for these students…")
-        delete_existing_for_students(list(students_data.keys()), detailed_def, summary_def)
-    else:
-        p("[STEP] Skipping per-student delete (WIPE_TABLES=1 already cleared tables).")
-
+    # Write fresh data
     p("[STEP] Writing detailed rows…")
     airtable_insert_detailed(detailed_rows)
     p("[STEP] Writing summary rows…")
