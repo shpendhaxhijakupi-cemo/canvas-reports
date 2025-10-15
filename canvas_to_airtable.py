@@ -29,7 +29,7 @@ ALLOW_SELECT_FALLBACK = os.environ.get("ALLOW_SELECT_FALLBACK", "0") == "1"
 SLEEP_BETWEEN_REQUESTS = float(os.environ.get("SLEEP_BETWEEN_REQUESTS", "0.0"))
 
 # NEW: wipe-all mode (delete everything in both tables first)
-WIPE_TABLES_FIRST = os.environ.get("WIPE_TABLES", "0") == "1"
+WIPE_TABLES_FIRST = os.environ.get("WIPE_TABLES", "1") == "1"
 
 # If provided, use comma-separated Canvas user IDs instead of prompting
 STUDENT_USER_IDS_ENV = os.environ.get("STUDENT_USER_IDS", "")
