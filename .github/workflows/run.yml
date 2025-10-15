@@ -11,34 +11,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        partner:
-          - name: phoenix
-            env:
-              AIRTABLE_DETAILED_TABLE: ${{ secrets.AIRTABLE_DETAILED_TABLE }}
-              AIRTABLE_SUMMARY_TABLE:  ${{ secrets.AIRTABLE_SUMMARY_TABLE }}
-              STUDENT_USER_IDS:        ${{ secrets.STUDENT_IDS_PHOENIX }}
-              PARTNER_NAME:            "Phoenix"
-
-          - name: nhcc
-            env:
-              AIRTABLE_DETAILED_TABLE: ${{ secrets.AIRTABLE_DETAILED_NHCC_TABLE }}
-              AIRTABLE_SUMMARY_TABLE:  ${{ secrets.AIRTABLE_SUMMARY_NHCC_TABLE }}
-              STUDENT_USER_IDS:        ${{ secrets.STUDENT_IDS_NHCC }}
-              PARTNER_NAME:            "NHCC"
-
-          - name: b2c
-            env:
-              AIRTABLE_DETAILED_TABLE: ${{ secrets.AIRTABLE_DETAILED_B2C_TABLE }}
-              AIRTABLE_SUMMARY_TABLE:  ${{ secrets.AIRTABLE_SUMMARY_B2C_TABLE }}
-              STUDENT_USER_IDS:        ${{ secrets.STUDENT_IDS_B2C }}
-              PARTNER_NAME:            "B2C"
-
-          - name: southlands
-            env:
-              AIRTABLE_DETAILED_TABLE: ${{ secrets.AIRTABLE_DETAILED_SOUTHLANDS_TABLE }}
-              AIRTABLE_SUMMARY_TABLE:  ${{ secrets.AIRTABLE_SUMMARY_SOUTHLANDS_TABLE }}
-              STUDENT_USER_IDS:        ${{ secrets.STUDENT_IDS_SOUTHLANDS }}
-              PARTNER_NAME:            "Southlands"
+        partner: [phoenix, nhcc, b2c, southlands]
 
     steps:
       - uses: actions/checkout@v4
@@ -52,19 +25,9 @@ jobs:
           pip install --upgrade pip
           pip install requests pyairtable
 
-      - name: Validate partner env
+      # Map per-partner secrets to generic env the script expects
+      - name: Prepare partner env
         shell: bash
-        env:
-          D_NM:  ${{ matrix.partner.env.AIRTABLE_DETAILED_TABLE }}
-          S_NM:  ${{ matrix.partner.env.AIRTABLE_SUMMARY_TABLE }}
-          SIDS:  ${{ matrix.partner.env.STUDENT_USER_IDS }}
-        run: |
-          echo "Detailed(Name)='${D_NM}'  Summary(Name)='${S_NM}'  Student IDs='${SIDS}'"
-          if [ -z "${SIDS}" ]; then echo "::error ::STUDENT_USER_IDS is empty"; exit 1; fi
-          if [ -z "${D_NM}" ];  then echo "::error ::AIRTABLE_DETAILED_TABLE is empty"; exit 1; fi
-          if [ -z "${S_NM}" ];  then echo "::error ::AIRTABLE_SUMMARY_TABLE is empty"; exit 1; fi
-
-      - name: Run sync for ${{ matrix.partner.name }}
         env:
           # Shared secrets
           CANVAS_API_URL:      ${{ secrets.CANVAS_API_URL }}
@@ -72,16 +35,78 @@ jobs:
           AIRTABLE_API_KEY:    ${{ secrets.AIRTABLE_API_KEY }}
           AIRTABLE_BASE_ID:    ${{ secrets.AIRTABLE_BASE_ID }}
 
-          # Partner-specific (from matrix)
-          AIRTABLE_DETAILED_TABLE: ${{ matrix.partner.env.AIRTABLE_DETAILED_TABLE }}
-          AIRTABLE_SUMMARY_TABLE:  ${{ matrix.partner.env.AIRTABLE_SUMMARY_TABLE }}
-          STUDENT_USER_IDS:        ${{ matrix.partner.env.STUDENT_USER_IDS }}
-          PARTNER_NAME:            ${{ matrix.partner.env.PARTNER_NAME }}
+          # Phoenix
+          AIRTABLE_DETAILED_TABLE_PHOENIX: ${{ secrets.AIRTABLE_DETAILED_TABLE }}
+          AIRTABLE_SUMMARY_TABLE_PHOENIX:  ${{ secrets.AIRTABLE_SUMMARY_TABLE }}
+          STUDENT_IDS_PHOENIX:             ${{ secrets.STUDENT_IDS_PHOENIX }}
 
-          # Optional
+          # NHCC
+          AIRTABLE_DETAILED_TABLE_NHCC: ${{ secrets.AIRTABLE_DETAILED_NHCC_TABLE }}
+          AIRTABLE_SUMMARY_TABLE_NHCC:  ${{ secrets.AIRTABLE_SUMMARY_NHCC_TABLE }}
+          STUDENT_IDS_NHCC:             ${{ secrets.STUDENT_IDS_NHCC }}
+
+          # B2C
+          AIRTABLE_DETAILED_TABLE_B2C: ${{ secrets.AIRTABLE_DETAILED_B2C_TABLE }}
+          AIRTABLE_SUMMARY_TABLE_B2C:  ${{ secrets.AIRTABLE_SUMMARY_B2C_TABLE }}
+          STUDENT_IDS_B2C:             ${{ secrets.STUDENT_IDS_B2C }}
+
+          # Southlands
+          AIRTABLE_DETAILED_TABLE_SOUTHLANDS: ${{ secrets.AIRTABLE_DETAILED_SOUTHLANDS_TABLE }}
+          AIRTABLE_SUMMARY_TABLE_SOUTHLANDS:  ${{ secrets.AIRTABLE_SUMMARY_SOUTHLANDS_TABLE }}
+          STUDENT_IDS_SOUTHLANDS:             ${{ secrets.STUDENT_IDS_SOUTHLANDS }}
+        run: |
+          set -euo pipefail
+          echo "CANVAS_API_URL=${CANVAS_API_URL}" >> "$GITHUB_ENV"
+          echo "CANVAS_ACCESS_TOKEN=${CANVAS_ACCESS_TOKEN}" >> "$GITHUB_ENV"
+          echo "AIRTABLE_API_KEY=${AIRTABLE_API_KEY}" >> "$GITHUB_ENV"
+          echo "AIRTABLE_BASE_ID=${AIRTABLE_BASE_ID}" >> "$GITHUB_ENV"
+
+          case "${{ matrix.partner }}" in
+            phoenix)
+              echo "AIRTABLE_DETAILED_TABLE=${AIRTABLE_DETAILED_TABLE_PHOENIX}" >> "$GITHUB_ENV"
+              echo "AIRTABLE_SUMMARY_TABLE=${AIRTABLE_SUMMARY_TABLE_PHOENIX}"   >> "$GITHUB_ENV"
+              echo "STUDENT_USER_IDS=${STUDENT_IDS_PHOENIX}"                    >> "$GITHUB_ENV"
+              echo "PARTNER_NAME=Phoenix"                                       >> "$GITHUB_ENV"
+              ;;
+            nhcc)
+              echo "AIRTABLE_DETAILED_TABLE=${AIRTABLE_DETAILED_TABLE_NHCC}" >> "$GITHUB_ENV"
+              echo "AIRTABLE_SUMMARY_TABLE=${AIRTABLE_SUMMARY_TABLE_NHCC}"   >> "$GITHUB_ENV"
+              echo "STUDENT_USER_IDS=${STUDENT_IDS_NHCC}"                    >> "$GITHUB_ENV"
+              echo "PARTNER_NAME=NHCC"                                       >> "$GITHUB_ENV"
+              ;;
+            b2c)
+              echo "AIRTABLE_DETAILED_TABLE=${AIRTABLE_DETAILED_TABLE_B2C}" >> "$GITHUB_ENV"
+              echo "AIRTABLE_SUMMARY_TABLE=${AIRTABLE_SUMMARY_TABLE_B2C}"   >> "$GITHUB_ENV"
+              echo "STUDENT_USER_IDS=${STUDENT_IDS_B2C}"                    >> "$GITHUB_ENV"
+              echo "PARTNER_NAME=B2C"                                       >> "$GITHUB_ENV"
+              ;;
+            southlands)
+              echo "AIRTABLE_DETAILED_TABLE=${AIRTABLE_DETAILED_TABLE_SOUTHLANDS}" >> "$GITHUB_ENV"
+              echo "AIRTABLE_SUMMARY_TABLE=${AIRTABLE_SUMMARY_TABLE_SOUTHLANDS}"   >> "$GITHUB_ENV"
+              echo "STUDENT_USER_IDS=${STUDENT_IDS_SOUTHLANDS}"                    >> "$GITHUB_ENV"
+              echo "PARTNER_NAME=Southlands"                                       >> "$GITHUB_ENV"
+              ;;
+            *)
+              echo "::error ::Unknown partner '${{ matrix.partner }}'"; exit 1;;
+          esac
+
+      - name: Validate env (fail fast if missing)
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Detailed=${AIRTABLE_DETAILED_TABLE}"
+          echo "Summary=${AIRTABLE_SUMMARY_TABLE}"
+          echo "Students=${STUDENT_USER_IDS}"
+          test -n "${AIRTABLE_DETAILED_TABLE}" || { echo "::error ::AIRTABLE_DETAILED_TABLE empty"; exit 1; }
+          test -n "${AIRTABLE_SUMMARY_TABLE}"  || { echo "::error ::AIRTABLE_SUMMARY_TABLE empty";  exit 1; }
+          test -n "${STUDENT_USER_IDS}"        || { echo "::error ::STUDENT_USER_IDS empty";        exit 1; }
+
+      - name: Run sync for ${{ matrix.partner }}
+        env:
           DEBUG: "1"
           LOG_SCHEMA: "1"
-          ALLOW_SELECT_FALLBACK: "0"
+          ALLOW_SELECT_FALLBACK: "0"   # set to "1" only if you kept single-selects that may get new values
+          SLEEP_BETWEEN_REQUESTS: "0.0"
+          PYTHONUNBUFFERED: "1"
         run: |
-          export PYTHONUNBUFFERED=1
           python canvas_to_airtable.py
