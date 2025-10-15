@@ -10,8 +10,7 @@ from pyairtable import Api
 # ==============================
 BASE_URL = os.environ["CANVAS_API_URL"].rstrip("/")
 CANVAS_ACCESS_TOKEN = os.environ["CANVAS_ACCESS_TOKEN"]
-# CANVAS_ACCOUNT_ID no longer used for term lookup, but keep for completeness
-CANVAS_ACCOUNT_ID = os.environ.get("CANVAS_ACCOUNT_ID", "1")
+CANVAS_ACCOUNT_ID = os.environ.get("CANVAS_ACCOUNT_ID", "1")  # not used for term lookup anymore
 
 AIRTABLE_API_KEY = os.environ["AIRTABLE_API_KEY"]
 AIRTABLE_BASE_ID = os.environ["AIRTABLE_BASE_ID"]
@@ -21,6 +20,15 @@ AIRTABLE_DETAILED_TABLE_ID = os.environ.get("AIRTABLE_DETAILED_TABLE_ID")
 AIRTABLE_SUMMARY_TABLE_ID  = os.environ.get("AIRTABLE_SUMMARY_TABLE_ID")
 AIRTABLE_DETAILED_TABLE = os.environ.get("AIRTABLE_DETAILED_TABLE", "Phoenix Student Assignment Details")
 AIRTABLE_SUMMARY_TABLE  = os.environ.get("AIRTABLE_SUMMARY_TABLE",  "Phoenix Christian Course Details")
+
+# Optional student field overrides (exact Airtable field names). If not set, auto-detect.
+AIRTABLE_STUDENT_ID_FIELD_DETAILED = os.environ.get("AIRTABLE_STUDENT_ID_FIELD_DETAILED")   # e.g. "Student ID"
+AIRTABLE_STUDENT_ID_FIELD_SUMMARY  = os.environ.get("AIRTABLE_STUDENT_ID_FIELD_SUMMARY")    # e.g. "Student ID"
+AIRTABLE_STUDENT_FIELD_DETAILED    = os.environ.get("AIRTABLE_STUDENT_FIELD_DETAILED")      # e.g. "Student Name"
+AIRTABLE_STUDENT_FIELD_SUMMARY     = os.environ.get("AIRTABLE_STUDENT_FIELD_SUMMARY")       # e.g. "Student Name"
+
+# Whitelist mode: delete any rows NOT in current run’s student list (by ID preferred, else Name)
+WIPE_NON_WHITELIST = os.environ.get("WIPE_NON_WHITELIST", "0") == "1"
 
 DEBUG = os.environ.get("DEBUG", "0") == "1"
 LOG_SCHEMA = os.environ.get("LOG_SCHEMA", "0") == "1"
@@ -320,14 +328,40 @@ def _coerce_percentage_for_schema(rows: List[dict], table_def: dict, field_name:
             if isinstance(v, (int, float)):
                 r[field_name] = f"{v*100:.2f}%"
 
+# -------- Choose student *name* or *id* field from schema / env ----------
+def _pick_field_from_schema(table_def: Optional[dict], preferred: Optional[str], fallbacks_ci: List[str]) -> Optional[str]:
+    """
+    Return exact-cased Airtable field name by:
+      1) using 'preferred' if it exists in schema;
+      2) otherwise try the list of lowercase fallback names in order.
+    """
+    if not table_def:
+        return None
+    names = {f.get("name"): f for f in table_def.get("fields", []) if f.get("name")}
+    # prefer explicit env override
+    if preferred and preferred in names:
+        return preferred
+    # fallbacks (case-insensitive)
+    lower_map = {n.lower(): n for n in names.keys()}
+    for ci in fallbacks_ci:
+        if ci in lower_map:
+            return lower_map[ci]
+    return None
+
+def _pick_student_id_field(detailed_def: Optional[dict], summary_def: Optional[dict]) -> Tuple[Optional[str], Optional[str]]:
+    det = _pick_field_from_schema(detailed_def, AIRTABLE_STUDENT_ID_FIELD_DETAILED, ["student id", "student_id", "id"])
+    summ = _pick_field_from_schema(summary_def,  AIRTABLE_STUDENT_ID_FIELD_SUMMARY,  ["student id", "student_id", "id"])
+    return det, summ
+
+def _pick_student_name_field(detailed_def: Optional[dict], summary_def: Optional[dict]) -> Tuple[Optional[str], Optional[str]]:
+    det = _pick_field_from_schema(detailed_def, AIRTABLE_STUDENT_FIELD_DETAILED, ["student name", "student", "name"])
+    summ = _pick_field_from_schema(summary_def,  AIRTABLE_STUDENT_FIELD_SUMMARY,  ["student name", "student", "name"])
+    return det, summ
+
 # ==============================
 # NEW: env-based student IDs
 # ==============================
 def _get_student_ids_from_env() -> List[str]:
-    """
-    Read comma-separated Canvas user IDs from the STUDENT_USER_IDS env var.
-    Exit cleanly if not provided.
-    """
     raw = os.environ.get("STUDENT_USER_IDS", "").strip()
     if not raw:
         p("[FATAL] STUDENT_USER_IDS is empty. Set it in the workflow env for this partner.")
@@ -339,19 +373,98 @@ def _get_student_ids_from_env() -> List[str]:
 # ==============================
 # CRUD helpers
 # ==============================
-def delete_existing_for_students(student_names: List[str]):
+def delete_existing_for_students(student_names: List[str], detailed_def: Optional[dict], summary_def: Optional[dict]):
+    """Legacy idempotent delete: remove rows for the students in this run (by name)."""
     if not student_names:
         p("[INFO] No students in run; nothing to delete.")
         return
 
+    det_field, sum_field = _pick_student_name_field(detailed_def, summary_def)
+
+    if not det_field and not sum_field:
+        p("[WARN] No recognizable student name field in either table; skipping deletions.")
+        return
+
     def esc(n: str) -> str: return n.replace('"', r'\"')
-    formula = "OR(" + ",".join([f'{{Student Name}} = "{esc(n)}"' for n in student_names]) + ")"
+    det_formula = "OR(" + ",".join([f'{{{det_field}}} = "{esc(n)}"' for n in student_names]) + ")" if det_field else None
+    sum_formula = "OR(" + ",".join([f'{{{sum_field}}} = "{esc(n)}"' for n in student_names]) + ")" if sum_field else None
+
     p(f"[INFO] Deleting existing rows for {len(student_names)} student(s)")
 
-    def collect_ids(table, formula: str) -> List[str]:
+    def collect_ids(table, formula: Optional[str]) -> List[str]:
+        if not formula:
+            return []
         ids: List[str] = []
         try:
             records = _airtable_retry(table.all, formula=formula) or []
+            for r in records:
+                if isinstance(r, dict) and r.get("id"):
+                    ids.append(r["id"])
+        except Exception:
+            # fallback paginator
+            for chunk in table.iterate(formula=formula):
+                if isinstance(chunk, dict) and chunk.get("id"):
+                    ids.append(chunk["id"])
+                elif isinstance(chunk, list):
+                    for r in chunk:
+                        if isinstance(r, dict) and r.get("id"):
+                            ids.append(r["id"])
+        return ids
+
+    det_ids = collect_ids(tbl_detailed, det_formula)
+    if det_field:
+        p(f"[INFO] Detailed: deleting {len(det_ids)} rows (field='{det_field}')")
+        for chunk in _chunks(det_ids, 50):
+            _airtable_retry(tbl_detailed.batch_delete, chunk)
+    else:
+        p("[WARN] Detailed: no student field found; skipping delete.")
+
+    sum_ids = collect_ids(tbl_summary, sum_formula)
+    if sum_field:
+        p(f"[INFO] Summary: deleting {len(sum_ids)} rows (field='{sum_field}')")
+        for chunk in _chunks(sum_ids, 50):
+            _airtable_retry(tbl_summary.batch_delete, chunk)
+    else:
+        p("[WARN] Summary: no student field found; skipping delete.")
+
+def wipe_non_whitelisted_records(whitelist_ids: List[str], whitelist_names: List[str],
+                                 detailed_def: Optional[dict], summary_def: Optional[dict]):
+    """
+    Whitelist mode: keep ONLY rows whose student *ID* (preferred) or Name
+    is in the current run; delete everything else.
+    """
+    if not whitelist_ids and not whitelist_names:
+        p("[WARN] Whitelist is empty; skipping wipe.")
+        return
+
+    det_id_field, sum_id_field   = _pick_student_id_field(detailed_def, summary_def)
+    det_name_field, sum_name_field = _pick_student_name_field(detailed_def, summary_def)
+
+    def _make_not_in_formula(field: str, values: List[str]) -> str:
+        # Airtable has IN() only in beta; emulate with NOT(OR(f=..., f=...))
+        if not values:
+            return ""  # shouldn't happen
+        def esc(v: str) -> str: return v.replace('"', r'\"')
+        ors = ",".join([f'{{{field}}} = "{esc(v)}"' for v in values])
+        return f"NOT(OR({ors}))"
+
+    def _delete_not_in(table, table_label: str, table_def: Optional[dict], id_field: Optional[str], name_field: Optional[str]):
+        formula = None
+        used_field = None
+        if id_field:
+            formula = _make_not_in_formula(id_field, whitelist_ids)
+            used_field = id_field
+        elif name_field:
+            formula = _make_not_in_formula(name_field, whitelist_names)
+            used_field = name_field
+        else:
+            p(f"[WARN] {table_label}: no suitable student field (ID or Name) found; skipping wipe.")
+            return
+
+        # Collect IDs matching NOT in whitelist
+        ids: List[str] = []
+        try:
+            records = _airtable_retry(tbl_detailed.all if table is tbl_detailed else tbl_summary.all, formula=formula) or []
             for r in records:
                 if isinstance(r, dict) and r.get("id"):
                     ids.append(r["id"])
@@ -363,17 +476,13 @@ def delete_existing_for_students(student_names: List[str]):
                     for r in chunk:
                         if isinstance(r, dict) and r.get("id"):
                             ids.append(r["id"])
-        return ids
 
-    det_ids = collect_ids(tbl_detailed, formula)
-    p(f"[INFO] Detailed: deleting {len(det_ids)} rows")
-    for chunk in _chunks(det_ids, 50):
-        _airtable_retry(tbl_detailed.batch_delete, chunk)
+        p(f"[INFO] {table_label}: wiping {len(ids)} rows not in whitelist (field='{used_field}')")
+        for chunk in _chunks(ids, 50):
+            _airtable_retry(table.batch_delete, chunk)
 
-    sum_ids = collect_ids(tbl_summary, formula)
-    p(f"[INFO] Summary: deleting {len(sum_ids)} rows")
-    for chunk in _chunks(sum_ids, 50):
-        _airtable_retry(tbl_summary.batch_delete, chunk)
+    _delete_not_in(tbl_detailed, "Detailed", detailed_def, det_id_field, det_name_field)
+    _delete_not_in(tbl_summary,  "Summary",  summary_def,  sum_id_field, sum_name_field)
 
 def airtable_insert_detailed(rows: List[dict]):
     p(f"[INFO] Inserting {len(rows)} detailed rows")
@@ -418,15 +527,16 @@ def main():
     # We no longer fetch global terms; rely on course.term.name
     p("[INFO] Skipping global terms lookup; using course.term.name from Canvas.")
 
-    # >>> UPDATED: read student IDs from env instead of input() <<<
-    user_ids = _get_student_ids_from_env()
+    user_ids = _get_student_ids_from_env()  # list of Canvas user IDs (strings)
 
-    students_data = {}
+    students_data: Dict[str, dict] = {}
+    id_to_name: Dict[str, str] = {}
 
     for user_id in user_ids:
         try:
             profile = get_user_profile_admin(user_id)
             student_name = profile.get("name", f"User {user_id}")
+            id_to_name[user_id] = student_name
 
             courses = get_all_active_courses_admin(user_id, term_id=None)
             seen_courses = set()
@@ -455,7 +565,7 @@ def main():
                     for a in assignments
                 ]
 
-            students_data[student_name] = {"detailed_data": all_data}
+            students_data[student_name] = {"student_id": user_id, "detailed_data": all_data}
         except requests.exceptions.HTTPError as e:
             status = e.response.status_code if e.response is not None else "?"
             p(f"[ERROR] User {user_id} failed with HTTP {status}. Ensure admin PAT with Masquerade.")
@@ -465,19 +575,21 @@ def main():
             traceback.print_exc()
             continue
 
-    # Flatten → Airtable rows
+    # Flatten → Airtable rows (now includes Student ID)
     detailed_rows: List[dict] = []
     summary_rows: List[dict] = []
 
     for student_name, data in students_data.items():
+        student_id = data.get("student_id")
         for (term_name, course_name), assignments in data["detailed_data"].items():
             total = len(assignments)
             completed = sum(1 for a in assignments if a.get("submission_status") in ["graded", "excused"])
             unsubmitted = total - completed
-            pct = (completed / total) if total > 0 else 0.0  # if your Airtable field expects 0-100, send pct*100
+            pct = (completed / total) if total > 0 else 0.0  # if your Airtable field expects 0-100, we coerce later if needed
 
             for a in assignments:
                 detailed_rows.append({
+                    "Student ID": student_id,
                     "Student Name": student_name,
                     "Term Name": term_name,
                     "Course Name": course_name,
@@ -488,6 +600,7 @@ def main():
                 })
 
             summary_rows.append({
+                "Student ID": student_id,
                 "Student Name": student_name,
                 "Term Name": term_name,
                 "Course Name": course_name,
@@ -521,9 +634,17 @@ def main():
     if summary_def:
         summary_rows  = _filter_rows_to_writable(summary_rows,  summary_def,  "Summary table")
 
-    # Idempotent write
-    p("[STEP] Deleting any prior rows for these students…")
-    delete_existing_for_students(list(students_data.keys()))
+    # ===== Deletions =====
+    # Whitelist mode: wipe all rows NOT in this run (prefer ID, else Name)
+    if WIPE_NON_WHITELIST:
+        p("[STEP] Whitelist cleanup: keeping only current students; wiping others…")
+        whitelist_names = list(students_data.keys())
+        wipe_non_whitelisted_records(user_ids, whitelist_names, detailed_def, summary_def)
+    else:
+        p("[STEP] Deleting any prior rows for these students…")
+        delete_existing_for_students(list(students_data.keys()), detailed_def, summary_def)
+
+    # ===== Writes =====
     p("[STEP] Writing detailed rows…")
     airtable_insert_detailed(detailed_rows)
     p("[STEP] Writing summary rows…")
