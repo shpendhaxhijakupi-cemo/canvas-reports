@@ -321,6 +321,22 @@ def _coerce_percentage_for_schema(rows: List[dict], table_def: dict, field_name:
                 r[field_name] = f"{v*100:.2f}%"
 
 # ==============================
+# NEW: env-based student IDs
+# ==============================
+def _get_student_ids_from_env() -> List[str]:
+    """
+    Read comma-separated Canvas user IDs from the STUDENT_USER_IDS env var.
+    Exit cleanly if not provided.
+    """
+    raw = os.environ.get("STUDENT_USER_IDS", "").strip()
+    if not raw:
+        p("[FATAL] STUDENT_USER_IDS is empty. Set it in the workflow env for this partner.")
+        raise SystemExit(1)
+    ids = [s.strip() for s in raw.split(",") if s.strip()]
+    p(f"[INFO] Using STUDENT_USER_IDS={ids}")
+    return ids
+
+# ==============================
 # CRUD helpers
 # ==============================
 def delete_existing_for_students(student_names: List[str]):
@@ -402,8 +418,8 @@ def main():
     # We no longer fetch global terms; rely on course.term.name
     p("[INFO] Skipping global terms lookup; using course.term.name from Canvas.")
 
-    user_ids = input("Enter the student user IDs (comma-separated): ").strip().split(",")
-    user_ids = [u.strip() for u in user_ids if u.strip()]
+    # >>> UPDATED: read student IDs from env instead of input() <<<
+    user_ids = _get_student_ids_from_env()
 
     students_data = {}
 
