@@ -19,8 +19,8 @@ AIRTABLE_BASE_ID = os.environ["AIRTABLE_BASE_ID"]
 # Prefer table IDs if provided; else use names
 AIRTABLE_DETAILED_TABLE_ID = os.environ.get("AIRTABLE_DETAILED_TABLE_ID")
 AIRTABLE_SUMMARY_TABLE_ID  = os.environ.get("AIRTABLE_SUMMARY_TABLE_ID")
-AIRTABLE_DETAILED_TABLE = os.environ.get("AIRTABLE_DETAILED_TABLE", "Phoenix Student Assignment Details")
-AIRTABLE_SUMMARY_TABLE  = os.environ.get("AIRTABLE_SUMMARY_TABLE",  "Phoenix Christian Course Details")
+AIRTABLE_DETAILED_TABLE = os.environ.get("AIRTABLE_DETAILED_TABLE", "Rock Christian Student Assignment Details")
+AIRTABLE_SUMMARY_TABLE  = os.environ.get("AIRTABLE_SUMMARY_TABLE",  "Rock Christian Christian Course Details")
 
 # Students list comes from env; supports comma or space separated
 STUDENT_USER_IDS = os.environ.get("STUDENT_USER_IDS", "")
