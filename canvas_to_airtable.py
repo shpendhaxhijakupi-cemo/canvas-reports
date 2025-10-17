@@ -30,16 +30,16 @@ SHOW_FETCH_ASSIGNMENTS = True
 SHOW_FETCH_SUBMISSIONS = True
 ENABLE_AIRTABLE_WRITE_PROBE = False
 
-# === HARD-CODED: always wipe tables first (no env flag) ===
+# === HARD-CODED: always wipe tables first ===
 WIPE_TABLES_FIRST = True
-FAST_WIPE_WORKERS = int(os.environ.get("FAST_WIPE_WORKERS", "6"))
+FAST_WIPE_WORKERS = int(os.environ.get("FAST_WIPE_WORKERS", "8"))   # parallel delete threads
 FAST_WIPE_PAGE_SIZE = int(os.environ.get("FAST_WIPE_PAGE_SIZE", "100"))
-AIRTABLE_RPS = float(os.environ.get("AIRTABLE_RPS", "5"))
+AIRTABLE_RPS = float(os.environ.get("AIRTABLE_RPS", "10"))          # crude throttle (requests/sec)
 
 # Student IDs from env (comma/space/newline separated)
 STUDENT_USER_IDS_RAW = os.environ.get("STUDENT_USER_IDS", "")
 
-# Skip these assignment titles (exact match, case-insensitive handled elsewhere)
+# Skip these assignment titles (exact match, lowercased elsewhere)
 SKIP_EXACT_TITLES = {"end of unit feedback", "quarterly feedback"}
 
 # ==============================
@@ -328,30 +328,54 @@ def _coerce_percentage_for_schema(rows: List[dict], table_def: dict, field_name:
 def _delete_chunk(table, ids: List[str]):
     _airtable_retry(table.batch_delete, ids)
 
-def _collect_all_ids(table) -> List[str]:
+def _collect_all_ids(table, label: str) -> List[str]:
+    """Robustly collect IDs. Try .all() first, then fall back to iterate()."""
     ids: List[str] = []
     sample: List[str] = []
-    for page in table.iterate(page_size=FAST_WIPE_PAGE_SIZE):
-        if isinstance(page, dict):
-            rid = page.get("id")
+
+    # Primary: .all() – simplest & reliable
+    try:
+        records = _airtable_retry(table.all, page_size=FAST_WIPE_PAGE_SIZE)
+        for r in records or []:
+            rid = r.get("id")
             if rid:
                 ids.append(rid)
                 if len(sample) < 3:
                     sample.append(rid)
-        else:
-            for rec in page:
-                rid = rec.get("id") if isinstance(rec, dict) else None
-                if rid:
-                    ids.append(rid)
-                    if len(sample) < 3:
-                        sample.append(rid)
+    except Exception:
+        # ignore and fall back below
+        pass
+
+    # Fallback: iterate() (page generator)
+    if not ids:
+        try:
+            for page in table.iterate(page_size=FAST_WIPE_PAGE_SIZE):
+                if isinstance(page, dict):
+                    rid = page.get("id")
+                    if rid:
+                        ids.append(rid)
+                        if len(sample) < 3:
+                            sample.append(rid)
+                else:
+                    for rec in page:
+                        rid = rec.get("id") if isinstance(rec, dict) else None
+                        if rid:
+                            ids.append(rid)
+                            if len(sample) < 3:
+                                sample.append(rid)
+        except Exception as e:
+            p(f"[WARN] {label}: iterate() failed to list records")
+            traceback.print_exc()
+
     if ids:
-        p(f"[WIPE] Found {len(ids)} records (sample IDs: {sample})")
+        p(f"[WIPE] {label}: found {len(ids)} record IDs (sample {sample})")
+    else:
+        p(f"[WIPE] {label}: no records returned by API. (Check table name/ID & token access.)")
     return ids
 
 def wipe_table_fast(table, label: str):
-    p(f"[WIPE] Collecting all record IDs from {label}...")
-    ids = _collect_all_ids(table)
+    p(f"[WIPE] Collecting all record IDs from {label}…")
+    ids = _collect_all_ids(table, label)
     total = len(ids)
     if not total:
         p(f"[WIPE] {label}: nothing to delete.")
@@ -423,7 +447,6 @@ def airtable_insert_summary(rows: List[dict]):
 def _parse_student_ids_from_env(raw: str) -> List[str]:
     if not raw:
         return []
-    # allow commas, spaces, newlines
     parts = [x.strip() for chunk in raw.replace("\n", ",").replace(" ", ",").split(",") for x in [chunk] if x.strip()]
     return parts
 
