@@ -10,8 +10,7 @@ from pyairtable import Api
 # ==============================
 BASE_URL = os.environ["CANVAS_API_URL"].rstrip("/")
 CANVAS_ACCESS_TOKEN = os.environ["CANVAS_ACCESS_TOKEN"]
-# CANVAS_ACCOUNT_ID no longer used for term lookup, but keep for completeness
-CANVAS_ACCOUNT_ID = os.environ.get("CANVAS_ACCOUNT_ID", "1")
+CANVAS_ACCOUNT_ID = os.environ.get("CANVAS_ACCOUNT_ID", "1")  # not used for terms now
 
 AIRTABLE_API_KEY = os.environ["AIRTABLE_API_KEY"]
 AIRTABLE_BASE_ID = os.environ["AIRTABLE_BASE_ID"]
@@ -22,13 +21,17 @@ AIRTABLE_SUMMARY_TABLE_ID  = os.environ.get("AIRTABLE_SUMMARY_TABLE_ID")
 AIRTABLE_DETAILED_TABLE = os.environ.get("AIRTABLE_DETAILED_TABLE", "Phoenix Student Assignment Details")
 AIRTABLE_SUMMARY_TABLE  = os.environ.get("AIRTABLE_SUMMARY_TABLE",  "Phoenix Christian Course Details")
 
-# Optional: comma-separated user IDs from env (so we don't prompt in CI)
-STUDENT_USER_IDS_ENV = os.environ.get("STUDENT_USER_IDS", "")
-
 DEBUG = os.environ.get("DEBUG", "0") == "1"
 LOG_SCHEMA = os.environ.get("LOG_SCHEMA", "0") == "1"
 ALLOW_SELECT_FALLBACK = os.environ.get("ALLOW_SELECT_FALLBACK", "0") == "1"
 SLEEP_BETWEEN_REQUESTS = float(os.environ.get("SLEEP_BETWEEN_REQUESTS", "0.0"))
+
+# NEW: extra controls for the course-name issue
+COURSE_NAME_STRICT = os.environ.get("COURSE_NAME_STRICT", "0") == "1"
+DUMP_RAW_COURSES  = os.environ.get("DUMP_RAW_COURSES",  "0") == "1"
+
+# Optional: wipe everything first (fast) before writing
+WIPE_TABLES_FIRST = os.environ.get("WIPE_TABLES_FIRST", "0") == "1"
 
 SHOW_FETCH_ASSIGNMENTS = True
 SHOW_FETCH_SUBMISSIONS = True
@@ -45,15 +48,52 @@ def dbg(msg: str):
     if DEBUG: p(f"[DEBUG] {msg}")
 
 # ==============================
-# Text cleaning
+# Small text helpers
 # ==============================
-def _clean_text(val: Optional[str]) -> str:
+def _clean_text(s: Optional[str]) -> Optional[str]:
+    if s is None:
+        return None
+    s = str(s).strip()
+    # collapse whitespace
+    s = " ".join(s.split())
+    return s or None
+
+def _looks_like_sentence(s: str) -> bool:
+    """Heuristics to catch chatty notes accidentally in course.name."""
+    if len(s) > 120:
+        return True
+    words = s.split()
+    if len(words) >= 12:
+        return True
+    starts = ("hi ", "hello ", "im ", "i'm ", "dont ", "fbi ", "hey ", "please ", "canvas ")
+    if s.lower().startswith(starts):
+        return True
+    # lots of punctuation is suspicious too
+    if sum(ch in ".!?," for ch in s) >= 2:
+        return True
+    return False
+
+def _pick_course_name(course: dict) -> str:
     """
-    Remove control characters/newlines/excess whitespace and cap length.
+    Prefer a clean, real course title. If 'name' looks like a sentence/note,
+    fall back to original_name -> course_code -> 'Course <id>'.
+    Set COURSE_NAME_STRICT=1 to always ignore 'name'.
     """
-    if not val:
-        return ""
-    return " ".join(str(val).split())[:300]
+    candidates: List[Optional[str]] = []
+    if not COURSE_NAME_STRICT:
+        candidates.append(course.get("name"))
+    candidates.extend([course.get("original_name"), course.get("course_code")])
+
+    for cand in candidates:
+        cand = _clean_text(cand)
+        if not cand:
+            continue
+        if not COURSE_NAME_STRICT and _looks_like_sentence(cand):
+            # likely a chatty sentence; try fallback
+            continue
+        return cand
+
+    return f"Course {course.get('id')}"
 
 # ==============================
 # Airtable setup
@@ -225,7 +265,6 @@ def _airtable_write_probe():
         p("[WARN] Probe create succeeded but cleanup failed; continuing")
 
 def _fetch_base_schema() -> Dict[str, dict]:
-    """Return {table_id: table_def} and {table_name: table_def} using Airtable schema API."""
     url = f"https://api.airtable.com/v0/meta/bases/{AIRTABLE_BASE_ID}/tables"
     headers = {"Authorization": f"Bearer {AIRTABLE_API_KEY}"}
     resp = requests.get(url, headers=headers, timeout=60)
@@ -284,7 +323,6 @@ def _validate_or_coerce_selects(rows: List[dict], table_def: dict, table_label: 
             if fname in r and r[fname] not in allowed:
                 r[fname] = fallback
 
-# Writable-field filtering
 def _writable_fieldnames(table_def: dict) -> set:
     non_writable = {"formula", "rollup", "lookup", "createdTime", "lastModifiedTime", "autoNumber", "button"}
     writable = set()
@@ -315,7 +353,6 @@ def _filter_rows_to_writable(rows: List[dict], table_def: dict, label: str) -> L
         pass
     return trimmed
 
-# Percent coercion helper (if Airtable field is singleLineText)
 def _field_type(table_def: dict, field_name: str) -> Optional[str]:
     for f in table_def.get("fields", []):
         if f.get("name") == field_name:
@@ -334,16 +371,32 @@ def _coerce_percentage_for_schema(rows: List[dict], table_def: dict, field_name:
             if isinstance(v, (int, float)):
                 r[field_name] = f"{v*100:.2f}%"
 
-def _field_info(table_def: dict, name: str) -> str:
-    for f in (table_def or {}).get("fields", []):
-        if f.get("name") == name:
-            return f"{name} → type={f.get('type')}"
-    return f"{name} → (not found in schema)"
-
 # ==============================
 # CRUD helpers
 # ==============================
+def wipe_table_fast(table_obj):
+    """Delete all rows in big chunks; faster than filtering by formula."""
+    try:
+        ids = [rec["id"] for rec in _airtable_retry(table_obj.all)]
+        if not ids:
+            return
+        p(f"[INFO] Wipe: deleting {len(ids)} rows")
+        for chunk in _chunks(ids, 50):
+            _airtable_retry(table_obj.batch_delete, chunk)
+    except Exception:
+        # fall back to iterate streaming if .all fails on giant tables
+        p("[WARN] Wipe: streaming delete via iterate()")
+        to_delete: List[str] = []
+        for page in table_obj.iterate():
+            for rec in page:
+                if isinstance(rec, dict) and rec.get("id"):
+                    to_delete.append(rec["id"])
+            for chunk in _chunks(to_delete, 50):
+                _airtable_retry(table_obj.batch_delete, chunk)
+            to_delete.clear()
+
 def delete_existing_for_students(student_names: List[str]):
+    """Kept for backward compatibility; not used when WIPE_TABLES_FIRST=1."""
     if not student_names:
         p("[INFO] No students in run; nothing to delete.")
         return
@@ -385,7 +438,7 @@ def airtable_insert_detailed(rows: List[dict]):
         return
     for i, chunk in enumerate(_chunks(rows, 10), start=1):
         try:
-            _airtable_retry(tbl_detailed.batch_create, chunk)  # pyairtable 2.x expects list[dict[field->value]]
+            _airtable_retry(tbl_detailed.batch_create, chunk)  # pyairtable 2.x
             dbg(f" detailed batch {i} ok ({len(chunk)})")
         except Exception:
             p(f"[ERROR] detailed batch {i} failed, first record preview:")
@@ -422,9 +475,11 @@ def main():
     # We no longer fetch global terms; rely on course.term.name
     p("[INFO] Skipping global terms lookup; using course.term.name from Canvas.")
 
-    # Student IDs: from env if present, else prompt (for local runs)
-    if STUDENT_USER_IDS_ENV.strip():
-        user_ids = [u.strip() for u in STUDENT_USER_IDS_ENV.split(",") if u.strip()]
+    # If STUDENT_USER_IDS is provided via env (matrix), use it; otherwise prompt.
+    env_ids = os.environ.get("STUDENT_USER_IDS", "")
+    if env_ids.strip():
+        user_ids = [u.strip() for u in env_ids.split(",") if u.strip()]
+        p(f"[INFO] Using STUDENT_USER_IDS from env: {user_ids}")
     else:
         user_ids = input("Enter the student user IDs (comma-separated): ").strip().split(",")
         user_ids = [u.strip() for u in user_ids if u.strip()]
@@ -434,9 +489,18 @@ def main():
     for user_id in user_ids:
         try:
             profile = get_user_profile_admin(user_id)
-            student_name = _clean_text(profile.get("name", f"User {user_id}"))
+            student_name = profile.get("name", f"User {user_id}")
 
             courses = get_all_active_courses_admin(user_id, term_id=None)
+
+            if DEBUG and DUMP_RAW_COURSES:
+                p(f"[DEBUG] Raw courses for user {user_id} ({student_name}):")
+                for c in courses:
+                    term_name = (c.get("term") or {}).get("name") or c.get("enrollment_term_id")
+                    p(f"  - id={c.get('id')} name={_clean_text(c.get('name'))!r} "
+                      f"orig={_clean_text(c.get('original_name'))!r} code={_clean_text(c.get('course_code'))!r} "
+                      f"term={term_name!r}")
+
             seen_courses = set()
             all_data: Dict[Tuple[str, str], List[dict]] = {}
 
@@ -446,26 +510,18 @@ def main():
                     continue
                 seen_courses.add(cid)
 
-                # Prefer real title; fall back sensibly, then sanitize
-                raw_course_name = (
-                    course.get("name")
-                    or course.get("original_name")
-                    or course.get("course_code")
-                    or f"Course {cid}"
-                )
-                course_name = _clean_text(raw_course_name)
-
+                course_name = _pick_course_name(course)  # <<<<<< NEW logic here
                 term_obj = course.get("term") or {}
                 term_id = course.get("enrollment_term_id")
-                term_name = _clean_text(term_obj.get("name") or (f"Term {term_id}" if term_id else "Unknown Term"))
+                term_name = term_obj.get("name") or (f"Term {term_id}" if term_id else "Unknown Term")
 
                 assignments = get_all_assignments(cid, stats)
                 all_data[(term_name, course_name)] = [
                     {
-                        "assignment_name": _clean_text(a.get("name")),
+                        "assignment_name": a["name"],
                         "due_date": a.get("due_at"),
                         "Course Name": course_name,
-                        "Term Name": term_name,  # real cleaned term name
+                        "Term Name": term_name,
                         **get_submission(cid, a["id"], user_id),
                     }
                     for a in assignments
@@ -490,7 +546,7 @@ def main():
             total = len(assignments)
             completed = sum(1 for a in assignments if a.get("submission_status") in ["graded", "excused"])
             unsubmitted = total - completed
-            pct = (completed / total) if total > 0 else 0.0  # if Airtable field expects 0-100, send pct*100
+            pct = (completed / total) if total > 0 else 0.0  # if Airtable expects 0-100, we format later if needed
 
             for a in assignments:
                 detailed_rows.append({
@@ -510,32 +566,17 @@ def main():
                 "Total Assignments": total,
                 "Completed": completed,
                 "Unsubmitted": unsubmitted,
-                "Percentage Completed": pct,  # may be coerced to text below
+                "Percentage Completed": pct,
             })
 
     p(f"[INFO] Built {len(detailed_rows)} detailed rows; {len(summary_rows)} summary rows.")
     p(f"[INFO] Students in run: {len(students_data)} → {list(students_data.keys())[:5]}{'...' if len(students_data)>5 else ''}")
-
-    # DEBUG preview of what we'll send to Airtable
-    if DEBUG:
-        p("[DEBUG] Sample rows going to Airtable (first 12 detailed):")
-        for r in detailed_rows[:12]:
-            p(f"  Student={r.get('Student Name')} | Term={r.get('Term Name')} | "
-              f"Course={r.get('Course Name')} | Assignment={r.get('Assignment Name')}")
 
     # ===== Schema check for select fields =====
     p("[STEP] Fetching base schema…")
     schema = _fetch_base_schema()
     detailed_def = schema.get(AIRTABLE_DETAILED_TABLE_ID or AIRTABLE_DETAILED_TABLE)
     summary_def  = schema.get(AIRTABLE_SUMMARY_TABLE_ID  or AIRTABLE_SUMMARY_TABLE)
-
-    if LOG_SCHEMA:
-        p("[SCHEMA] Detailed table field types:")
-        p("   " + _field_info(detailed_def, "Course Name"))
-        p("   " + _field_info(detailed_def, "Assignment Name"))
-        p("[SCHEMA] Summary table field types:")
-        p("   " + _field_info(summary_def, "Course Name"))
-
     if detailed_def:
         _validate_or_coerce_selects(detailed_rows, detailed_def, "Detailed table")
     if summary_def:
@@ -552,9 +593,15 @@ def main():
     if summary_def:
         summary_rows  = _filter_rows_to_writable(summary_rows,  summary_def,  "Summary table")
 
-    # Idempotent write
-    p("[STEP] Deleting any prior rows for these students…")
-    delete_existing_for_students(list(students_data.keys()))
+    # Wipe-first or targeted delete
+    if WIPE_TABLES_FIRST:
+        p("[STEP] Wipe-first is ON — clearing both tables…")
+        wipe_table_fast(tbl_detailed)
+        wipe_table_fast(tbl_summary)
+    else:
+        p("[STEP] Deleting any prior rows for these students…")
+        delete_existing_for_students(list(students_data.keys()))
+
     p("[STEP] Writing detailed rows…")
     airtable_insert_detailed(detailed_rows)
     p("[STEP] Writing summary rows…")
