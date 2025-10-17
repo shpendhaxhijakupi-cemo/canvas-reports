@@ -21,7 +21,7 @@ AIRTABLE_SUMMARY_TABLE_ID  = os.environ.get("AIRTABLE_SUMMARY_TABLE_ID")
 AIRTABLE_DETAILED_TABLE = os.environ.get("AIRTABLE_DETAILED_TABLE", "Phoenix Student Assignment Details")
 AIRTABLE_SUMMARY_TABLE  = os.environ.get("AIRTABLE_SUMMARY_TABLE",  "Phoenix Christian Course Details")
 
-DEBUG = os.environ.get("DEBUG", "0") == "1"
+DEBUG = os.environ.get("DEBUG", "1") == "1"
 LOG_SCHEMA = os.environ.get("LOG_SCHEMA", "0") == "1"
 ALLOW_SELECT_FALLBACK = os.environ.get("ALLOW_SELECT_FALLBACK", "0") == "1"
 SLEEP_BETWEEN_REQUESTS = float(os.environ.get("SLEEP_BETWEEN_REQUESTS", "0.0"))
@@ -31,7 +31,7 @@ COURSE_NAME_STRICT = os.environ.get("COURSE_NAME_STRICT", "0") == "1"
 DUMP_RAW_COURSES  = os.environ.get("DUMP_RAW_COURSES",  "0") == "1"
 
 # Optional: wipe everything first (fast) before writing
-WIPE_TABLES_FIRST = os.environ.get("WIPE_TABLES_FIRST", "0") == "1"
+WIPE_TABLES_FIRST = os.environ.get("WIPE_TABLES_FIRST", "1") == "1"
 
 SHOW_FETCH_ASSIGNMENTS = True
 SHOW_FETCH_SUBMISSIONS = True
