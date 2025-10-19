@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import requests
 import traceback
@@ -30,17 +31,29 @@ SHOW_FETCH_ASSIGNMENTS = True
 SHOW_FETCH_SUBMISSIONS = True
 ENABLE_AIRTABLE_WRITE_PROBE = False
 
+# — Ensure “chatty” assignments don’t pollute your view —
+SKIP_DISCUSSIONS = os.environ.get("SKIP_DISCUSSIONS", "1") == "1"  # default skip graded discussions
+SKIP_JOURNALS    = os.environ.get("SKIP_JOURNALS",    "0") == "1"
+SKIP_PRACTICE    = os.environ.get("SKIP_PRACTICE",    "0") == "1"
+
 # === HARD-CODED: always wipe tables first ===
 WIPE_TABLES_FIRST = True
-FAST_WIPE_WORKERS = int(os.environ.get("FAST_WIPE_WORKERS", "8"))   # parallel delete threads
+FAST_WIPE_WORKERS = int(os.environ.get("FAST_WIPE_WORKERS", "8"))
 FAST_WIPE_PAGE_SIZE = int(os.environ.get("FAST_WIPE_PAGE_SIZE", "100"))
-AIRTABLE_RPS = float(os.environ.get("AIRTABLE_RPS", "10"))          # crude throttle (requests/sec)
+AIRTABLE_RPS = float(os.environ.get("AIRTABLE_RPS", "10"))
 
 # Student IDs from env (comma/space/newline separated)
 STUDENT_USER_IDS_RAW = os.environ.get("STUDENT_USER_IDS", "")
 
-# Skip these assignment titles (exact match, lowercased elsewhere)
+# Skip these assignment titles (exact match, lowercased)
 SKIP_EXACT_TITLES = {"end of unit feedback", "quarterly feedback"}
+
+# HTML stripper for assignment titles
+_TAG_RE = re.compile(r"<[^>]+>")
+def clean_text(s: Optional[str]) -> str:
+    if not s:
+        return ""
+    return _TAG_RE.sub("", s).replace("\u200b", "").strip()
 
 # ==============================
 # Print helpers
@@ -117,14 +130,34 @@ def get_all_assignments(course_id: int, stats: dict) -> List[dict]:
         for a in data:
             if not a.get("published"):
                 continue
-            name_norm = (a.get("name") or "").strip().lower()
+
+            # Optionally skip discussion/journal/practice items
+            submission_types = a.get("submission_types") or []
+            name_raw = a.get("name") or ""
+            name_norm = name_raw.strip().lower()
+
+            if SKIP_DISCUSSIONS and "discussion_topic" in submission_types:
+                stats["skipped"] += 1
+                continue
+            if SKIP_JOURNALS and "journal" in name_norm:
+                stats["skipped"] += 1
+                continue
+            if SKIP_PRACTICE and "practice" in name_norm:
+                stats["skipped"] += 1
+                continue
             if name_norm in SKIP_EXACT_TITLES:
                 stats["skipped"] += 1
                 continue
+
             if SHOW_FETCH_ASSIGNMENTS:
-                p(f"[KEEP] assignment {a.get('id')} '{a.get('name')}' course {course_id}")
+                p(f"[KEEP] assignment {a.get('id')} '{clean_text(name_raw)}' course {course_id}")
+
+            # Store cleaned title so we never leak HTML-y strings
+            a = dict(a)
+            a["name"] = clean_text(a.get("name"))
             out.append(a)
             stats["processed"] += 1
+
         links = resp.headers.get("Link", "")
         next_url = None
         for link in links.split(","):
@@ -329,11 +362,8 @@ def _delete_chunk(table, ids: List[str]):
     _airtable_retry(table.batch_delete, ids)
 
 def _collect_all_ids(table, label: str) -> List[str]:
-    """Robustly collect IDs. Try .all() first, then fall back to iterate()."""
     ids: List[str] = []
     sample: List[str] = []
-
-    # Primary: .all() – simplest & reliable
     try:
         records = _airtable_retry(table.all, page_size=FAST_WIPE_PAGE_SIZE)
         for r in records or []:
@@ -343,10 +373,7 @@ def _collect_all_ids(table, label: str) -> List[str]:
                 if len(sample) < 3:
                     sample.append(rid)
     except Exception:
-        # ignore and fall back below
         pass
-
-    # Fallback: iterate() (page generator)
     if not ids:
         try:
             for page in table.iterate(page_size=FAST_WIPE_PAGE_SIZE):
@@ -363,10 +390,9 @@ def _collect_all_ids(table, label: str) -> List[str]:
                             ids.append(rid)
                             if len(sample) < 3:
                                 sample.append(rid)
-        except Exception as e:
+        except Exception:
             p(f"[WARN] {label}: iterate() failed to list records")
             traceback.print_exc()
-
     if ids:
         p(f"[WIPE] {label}: found {len(ids)} record IDs (sample {sample})")
     else:
@@ -381,21 +407,18 @@ def wipe_table_fast(table, label: str):
         p(f"[WIPE] {label}: nothing to delete.")
         return
     p(f"[WIPE] {label}: deleting {total} records in parallel…")
-
-    chunks: List[List[str]] = list(_chunks(ids, 10))  # 10 IDs per request
+    chunks: List[List[str]] = list(_chunks(ids, 10))
     max_workers = max(1, FAST_WIPE_WORKERS)
     per_second = max(1, int(AIRTABLE_RPS))
     submitted = 0
     done_reqs = 0
-
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futures = []
         for ch in chunks:
             futures.append(ex.submit(_delete_chunk, table, ch))
             submitted += 1
             if submitted % per_second == 0:
-                time.sleep(1.0)  # crude throttle
-
+                time.sleep(1.0)
         for fut in as_completed(futures):
             try:
                 fut.result()
@@ -405,7 +428,6 @@ def wipe_table_fast(table, label: str):
             except Exception:
                 p(f"[WARN] {label}: a delete batch failed; continuing")
                 traceback.print_exc()
-
     p(f"[WIPE] {label}: wipe complete (requests: {len(chunks)}, rows≈{total}).")
 
 # ==============================
@@ -487,17 +509,24 @@ def main():
                     continue
                 seen_courses.add(cid)
 
-                course_name = course.get("name", f"Course {cid}")
+                # ✅ COURSE NAME ALWAYS FROM THE COURSE OBJECT
+                course_name = course.get("name") or course.get("course_code") or f"Course {cid}"
                 term_obj = course.get("term") or {}
                 term_id = course.get("enrollment_term_id")
                 term_name = term_obj.get("name") or (f"Term {term_id}" if term_id else "Unknown Term")
 
                 assignments = get_all_assignments(cid, stats)
+
+                # Helpful debug sampler to prove course vs assignment for odd cases
+                if DEBUG and assignments[:3]:
+                    for _r in assignments[:3]:
+                        p(f"[DEBUG] sample → course={course_name!r}, assignment={_r.get('name')!r}")
+
                 all_data[(term_name, course_name)] = [
                     {
-                        "assignment_name": a["name"],
+                        "assignment_name": clean_text(a.get("name")),
                         "due_date": a.get("due_at"),
-                        "Course Name": course_name,
+                        "Course Name": course_name,  # <- stays the course name
                         "Term Name": term_name,
                         **get_submission(cid, a["id"], user_id),
                     }
@@ -529,7 +558,7 @@ def main():
                 detailed_rows.append({
                     "Student Name": student_name,
                     "Term Name": term_name,
-                    "Course Name": course_name,
+                    "Course Name": course_name,                     # ✅ still the course name
                     "Assignment Name": a.get("assignment_name", "N/A"),
                     "Due Date": a.get("due_date") or None,
                     "Submission Status": a.get("submission_status", "unsubmitted"),
@@ -539,11 +568,11 @@ def main():
             summary_rows.append({
                 "Student Name": student_name,
                 "Term Name": term_name,
-                "Course Name": course_name,
+                "Course Name": course_name,                         # ✅ still the course name
                 "Total Assignments": total,
                 "Completed": completed,
                 "Unsubmitted": unsubmitted,
-                "Percentage Completed": pct,  # coerced to text if needed
+                "Percentage Completed": pct,
             })
 
     p(f"[INFO] Built {len(detailed_rows)} detailed rows; {len(summary_rows)} summary rows.")
@@ -578,7 +607,7 @@ def main():
 
     p("\n=== Run Summary (All Terms) ===")
     p(f"Assignments processed: {stats['processed']}")
-    p(f"Assignments skipped  : {stats['skipped']} (exact-title skips)")
+    p(f"Assignments skipped  : {stats['skipped']} (filters & exact-title skips)")
     p("===============================")
 
 if __name__ == "__main__":
