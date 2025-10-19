@@ -1,7 +1,5 @@
 import os
 import time
-import re
-import html
 import requests
 import traceback
 from typing import Dict, List, Tuple, Optional
@@ -32,16 +30,16 @@ SHOW_FETCH_ASSIGNMENTS = True
 SHOW_FETCH_SUBMISSIONS = True
 ENABLE_AIRTABLE_WRITE_PROBE = False
 
-# ALWAYS wipe first (hard-coded)
+# === HARD-CODED: always wipe tables first ===
 WIPE_TABLES_FIRST = True
-FAST_WIPE_WORKERS = int(os.environ.get("FAST_WIPE_WORKERS", "8"))
+FAST_WIPE_WORKERS = int(os.environ.get("FAST_WIPE_WORKERS", "8"))   # parallel delete threads
 FAST_WIPE_PAGE_SIZE = int(os.environ.get("FAST_WIPE_PAGE_SIZE", "100"))
-AIRTABLE_RPS = float(os.environ.get("AIRTABLE_RPS", "10"))
+AIRTABLE_RPS = float(os.environ.get("AIRTABLE_RPS", "10"))          # crude throttle (requests/sec)
 
 # Student IDs from env (comma/space/newline separated)
 STUDENT_USER_IDS_RAW = os.environ.get("STUDENT_USER_IDS", "")
 
-# Exact-title skips
+# Skip these assignment titles (exact match, lowercased elsewhere)
 SKIP_EXACT_TITLES = {"end of unit feedback", "quarterly feedback"}
 
 # ==============================
@@ -79,30 +77,11 @@ def make_canvas_request(endpoint: str, params=None):
 def get_user_profile_admin(user_id: str) -> dict:
     return make_canvas_request("users/self/profile", params={"as_user_id": user_id}).json()
 
-def _sanitize_course_name(name: Optional[str]) -> str:
-    """
-    Best-effort cleaning to ensure we never store chatty comments/HTML as course names.
-    """
-    if not name:
-        return "Unknown Course"
-    # Unescape HTML entities and strip tags
-    s = html.unescape(re.sub(r"<[^>]*>", "", str(name)))
-    s = s.replace("\n", " ").replace("\r", " ").strip()
-    # If it's suspiciously long or conversational, fall back
-    if len(s) > 200:
-        return s[:200]
-    bad_keywords = (" i ", " i'm ", " im ", " love ", " dun dun ", " smart ", "hello ", " hi ")
-    # compare on lowercase with padding
-    low = f" {s.lower()} "
-    if any(k in low for k in bad_keywords):
-        # Very unlikely for real course names; keep first 80 safe chars or mark unknown
-        s2 = re.sub(r"[^A-Za-z0-9 .&()/'\-:,_]+", "", s).strip()
-        if not s2 or len(s2) < 4:
-            return "Unknown Course"
-        return s2[:80]
-    return s
-
 def get_all_active_courses_admin(user_id: str, term_id=None) -> List[dict]:
+    """
+    Request includes term; Canvas returns student-personalized course info.
+    We'll prefer 'original_name' to avoid student nicknames being used.
+    """
     states = ["active", "invited_or_pending", "completed", "inactive"]
     seen = set()
     courses: List[dict] = []
@@ -118,9 +97,6 @@ def get_all_active_courses_admin(user_id: str, term_id=None) -> List[dict]:
                 cid = c.get("id")
                 if cid and cid not in seen:
                     seen.add(cid)
-                    # sanitize the name in-place so downstream is safe
-                    if "name" in c:
-                        c["name"] = _sanitize_course_name(c.get("name"))
                     courses.append(c)
             # pagination
             links = resp.headers.get("Link", "")
@@ -173,7 +149,7 @@ def get_submission(course_id: int, assignment_id: int, user_id: str) -> dict:
         grade = sub.get("grade", "N/A")
         if sub.get("excused", False):
             return {"submission_status": "excused", "grade": "Excused"}
-        if state in ["graded", "submitted"] and grade not in [None, "-", ""] and str(grade).strip() != "":
+        if state in ["graded", "submitted"] and grade not in [None, "-", ""]:
             return {"submission_status": "graded", "grade": grade}
         return {"submission_status": "unsubmitted", "grade": "N/A"}
     except requests.exceptions.HTTPError as e:
@@ -301,6 +277,7 @@ def _validate_or_coerce_selects(rows: List[dict], table_def: dict, table_label: 
             if fname in r and r[fname] not in allowed:
                 r[fname] = fallback
 
+# Writable-field filtering
 def _writable_fieldnames(table_def: dict) -> set:
     non_writable = {"formula", "rollup", "lookup", "createdTime", "lastModifiedTime", "autoNumber", "button"}
     writable = set()
@@ -350,82 +327,89 @@ def _coerce_percentage_for_schema(rows: List[dict], table_def: dict, field_name:
                 r[field_name] = f"{v*100:.2f}%"
 
 # ==============================
-# FAST WIPE HELPERS (multi-pass, verified)
+# FAST WIPE HELPERS (always used)
 # ==============================
 def _delete_chunk(table, ids: List[str]):
     _airtable_retry(table.batch_delete, ids)
 
 def _collect_all_ids(table, label: str) -> List[str]:
+    """Robustly collect IDs. Try .all() first, then fall back to iterate()."""
     ids: List[str] = []
+    sample: List[str] = []
+
+    # Primary: .all()
     try:
-        for rec in _airtable_retry(table.all, page_size=FAST_WIPE_PAGE_SIZE) or []:
-            rid = rec.get("id")
+        records = _airtable_retry(table.all, page_size=FAST_WIPE_PAGE_SIZE)
+        for r in records or []:
+            rid = r.get("id")
             if rid:
                 ids.append(rid)
+                if len(sample) < 3:
+                    sample.append(rid)
     except Exception:
+        pass
+
+    # Fallback: iterate()
+    if not ids:
         try:
             for page in table.iterate(page_size=FAST_WIPE_PAGE_SIZE):
                 if isinstance(page, dict):
                     rid = page.get("id")
-                    if rid: ids.append(rid)
+                    if rid:
+                        ids.append(rid)
+                        if len(sample) < 3:
+                            sample.append(rid)
                 else:
                     for rec in page:
                         rid = rec.get("id") if isinstance(rec, dict) else None
-                        if rid: ids.append(rid)
+                        if rid:
+                            ids.append(rid)
+                            if len(sample) < 3:
+                                sample.append(rid)
         except Exception:
             p(f"[WARN] {label}: iterate() failed to list records")
             traceback.print_exc()
+
+    if ids:
+        p(f"[WIPE] {label}: found {len(ids)} record IDs (sample {sample})")
+    else:
+        p(f"[WIPE] {label}: no records returned by API. (Check table name/ID & token access.)")
     return ids
 
 def wipe_table_fast(table, label: str):
-    max_passes = 5
-    for attempt in range(1, max_passes + 1):
-        ids = _collect_all_ids(table, label)
-        remaining = len(ids)
-        if remaining == 0:
-            p(f"[WIPE] {label}: already empty.")
-            return
+    p(f"[WIPE] Collecting all record IDs from {label}…")
+    ids = _collect_all_ids(table, label)
+    total = len(ids)
+    if not total:
+        p(f"[WIPE] {label}: nothing to delete.")
+        return
+    p(f"[WIPE] {label}: deleting {total} records in parallel…")
 
-        p(f"[WIPE] {label}: pass {attempt}/{max_passes} – deleting {remaining} records in parallel…")
-        chunks: List[List[str]] = list(_chunks(ids, 10))
-        max_workers = max(1, FAST_WIPE_WORKERS)
-        per_second = max(1, int(AIRTABLE_RPS))
-        submitted = 0
+    chunks: List[List[str]] = list(_chunks(ids, 10))  # 10 IDs per request
+    max_workers = max(1, FAST_WIPE_WORKERS)
+    per_second = max(1, int(AIRTABLE_RPS))
+    submitted = 0
+    done_reqs = 0
 
-        with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            futures = []
-            for ch in chunks:
-                futures.append(ex.submit(_delete_chunk, table, ch))
-                submitted += 1
-                if submitted % per_second == 0:
-                    time.sleep(1.0)
-            for fut in as_completed(futures):
-                try:
-                    fut.result()
-                except Exception:
-                    # We'll verify after the pass
-                    pass
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = []
+        for ch in chunks:
+            futures.append(ex.submit(_delete_chunk, table, ch))
+            submitted += 1
+            if submitted % per_second == 0:
+                time.sleep(1.0)  # crude throttle
 
-        left = len(_collect_all_ids(table, label))
-        if left == 0:
-            p(f"[WIPE] {label}: wipe complete.")
-            return
-        p(f"[WIPE] {label}: {left} records survived after pass {attempt}; retrying…")
-
-    # Stubborn survivors – delete individually
-    stubborn = _collect_all_ids(table, label)
-    if stubborn:
-        p(f"[WIPE] {label}: stubborn {len(stubborn)} records – deleting one-by-one…")
-        for rid in stubborn:
+        for fut in as_completed(futures):
             try:
-                _airtable_retry(table.delete, rid)
+                fut.result()
+                done_reqs += 1
+                if done_reqs % 50 == 0:
+                    dbg(f"[WIPE] {label}: ~{done_reqs*10} rows deleted (requests: {done_reqs})")
             except Exception:
-                p(f"[WARN] {label}: could not delete record {rid} even after retries.")
-        final_left = len(_collect_all_ids(table, label))
-        if final_left == 0:
-            p(f"[WIPE] {label}: final wipe complete.")
-        else:
-            p(f"[WARN] {label}: {final_left} record(s) still present. Check token/table ID or permissions.")
+                p(f"[WARN] {label}: a delete batch failed; continuing")
+                traceback.print_exc()
+
+    p(f"[WIPE] {label}: wipe complete (requests: {len(chunks)}, rows≈{total}).")
 
 # ==============================
 # CRUD helpers (writes)
@@ -506,8 +490,9 @@ def main():
                     continue
                 seen_courses.add(cid)
 
-                # already sanitized in get_all_active_courses_admin
-                course_name = course.get("name", f"Course {cid}")
+                # ✅ Prefer official course name; fall back to student's nickname only if needed
+                course_name = course.get("original_name") or course.get("name") or f"Course {cid}"
+
                 term_obj = course.get("term") or {}
                 term_id = course.get("enrollment_term_id")
                 term_name = term_obj.get("name") or (f"Term {term_id}" if term_id else "Unknown Term")
