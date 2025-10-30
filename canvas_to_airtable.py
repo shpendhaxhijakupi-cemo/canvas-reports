@@ -2,6 +2,7 @@ import os
 import time
 import requests
 import traceback
+import re  # ← added
 from typing import Dict, List, Tuple, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pyairtable import Api
@@ -41,6 +42,18 @@ STUDENT_USER_IDS_RAW = os.environ.get("STUDENT_USER_IDS", "")
 
 # Skip these assignment titles (exact match, lowercased elsewhere)
 SKIP_EXACT_TITLES = {"end of unit feedback", "quarterly feedback"}
+
+# Exclude these courses (exact name or containing the word "Live")
+EXCLUDED_COURSE_EXACT = {"canvas student orientation program"}
+_EXCLUDED_LIVE_RE = re.compile(r"\blive\b", re.IGNORECASE)
+
+def _is_excluded_course(name: Optional[str]) -> bool:
+    if not name:
+        return False
+    n = name.strip().lower()
+    if n in EXCLUDED_COURSE_EXACT:
+        return True
+    return bool(_EXCLUDED_LIVE_RE.search(name))
 
 # ==============================
 # Print helpers
@@ -492,6 +505,11 @@ def main():
 
                 # ✅ Prefer official course name; fall back to student's nickname only if needed
                 course_name = course.get("original_name") or course.get("name") or f"Course {cid}"
+
+                # ⛔ Exclude configured courses
+                if _is_excluded_course(course_name):
+                    p(f"[SKIP COURSE] Excluding course '{course_name}' (id {cid})")
+                    continue
 
                 term_obj = course.get("term") or {}
                 term_id = course.get("enrollment_term_id")
