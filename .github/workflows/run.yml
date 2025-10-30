@@ -11,7 +11,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        partner: [phoenix, nhcc, b2c, southlands]
+        partner:
+          - phoenix
+          - nhcc
+          - b2c
+          - southlands
+          - nhcc_journey
+          - nhcc_ironwood
+          - nhcc_central
+          - nhcc_grace
+          - earl_franklin
+          - odisea
 
     steps:
       - uses: actions/checkout@v4
@@ -25,11 +35,11 @@ jobs:
           pip install --upgrade pip
           pip install requests pyairtable
 
-      # Map per-partner secrets to generic env the script expects
+      # Map per-partner secrets to the generic env that canvas_to_airtable.py expects
       - name: Prepare partner env
         shell: bash
         env:
-          # Shared secrets
+          # Shared
           CANVAS_API_URL:      ${{ secrets.CANVAS_API_URL }}
           CANVAS_ACCESS_TOKEN: ${{ secrets.CANVAS_ACCESS_TOKEN }}
           AIRTABLE_API_KEY:    ${{ secrets.AIRTABLE_API_KEY }}
@@ -40,7 +50,7 @@ jobs:
           AIRTABLE_SUMMARY_TABLE_PHOENIX:  ${{ secrets.AIRTABLE_SUMMARY_TABLE }}
           STUDENT_IDS_PHOENIX:             ${{ secrets.STUDENT_IDS_PHOENIX }}
 
-          # NHCC
+          # NHCC (legacy, all-NHCC)
           AIRTABLE_DETAILED_TABLE_NHCC: ${{ secrets.AIRTABLE_DETAILED_NHCC_TABLE }}
           AIRTABLE_SUMMARY_TABLE_NHCC:  ${{ secrets.AIRTABLE_SUMMARY_NHCC_TABLE }}
           STUDENT_IDS_NHCC:             ${{ secrets.STUDENT_IDS_NHCC }}
@@ -54,12 +64,44 @@ jobs:
           AIRTABLE_DETAILED_TABLE_SOUTHLANDS: ${{ secrets.AIRTABLE_DETAILED_SOUTHLANDS_TABLE }}
           AIRTABLE_SUMMARY_TABLE_SOUTHLANDS:  ${{ secrets.AIRTABLE_SUMMARY_SOUTHLANDS_TABLE }}
           STUDENT_IDS_SOUTHLANDS:             ${{ secrets.STUDENT_IDS_SOUTHLANDS }}
+
+          # --- NEW PARTNERS BELOW ---
+
+          # NHCC Journey
+          AIRTABLE_DETAILED_TABLE_NHCC_JOURNEY: ${{ secrets.AIRTABLE_DETAILED_NHCC_JOURNEY_TABLE }}
+          AIRTABLE_SUMMARY_TABLE_NHCC_JOURNEY:  ${{ secrets.AIRTABLE_SUMMARY_NHCC_JOURNEY_TABLE }}
+          STUDENT_IDS_NHCC_JOURNEY:             ${{ secrets.STUDENT_IDS_NHCC_JOURNEY }}
+
+          # NHCC Ironwood
+          AIRTABLE_DETAILED_TABLE_NHCC_IRONWOOD: ${{ secrets.AIRTABLE_DETAILED_NHCC_IRONWOOD_TABLE }}
+          AIRTABLE_SUMMARY_TABLE_NHCC_IRONWOOD:  ${{ secrets.AIRTABLE_SUMMARY_NHCC_IRONWOOD_TABLE }}
+          STUDENT_IDS_NHCC_IRONWOOD:             ${{ secrets.STUDENT_IDS_NHCC_IRONWOOD }}
+
+          # NHCC Central
+          AIRTABLE_DETAILED_TABLE_NHCC_CENTRAL: ${{ secrets.AIRTABLE_DETAILED_NHCC_CENTRAL_TABLE }}
+          AIRTABLE_SUMMARY_TABLE_NHCC_CENTRAL:  ${{ secrets.AIRTABLE_SUMMARY_NHCC_CENTRAL_TABLE }}
+          STUDENT_IDS_NHCC_CENTRAL:             ${{ secrets.STUDENT_IDS_NHCC_CENTRAL }}
+
+          # NHCC GRACE
+          AIRTABLE_DETAILED_TABLE_NHCC_GRACE: ${{ secrets.AIRTABLE_DETAILED_NHCC_GRACE_TABLE }}
+          AIRTABLE_SUMMARY_TABLE_NHCC_GRACE:  ${{ secrets.AIRTABLE_SUMMARY_NHCC_GRACE_TABLE }}
+          STUDENT_IDS_NHCC_GRACE:             ${{ secrets.STUDENT_IDS_NHCC_GRACE }}
+
+          # Earl Franklin
+          AIRTABLE_DETAILED_TABLE_EARL_FRANKLIN: ${{ secrets.AIRTABLE_DETAILED_EARL_FRANKLIN_TABLE }}
+          AIRTABLE_SUMMARY_TABLE_EARL_FRANKLIN:  ${{ secrets.AIRTABLE_SUMMARY_EARL_FRANKLIN_TABLE }}
+          STUDENT_IDS_EARL_FRANKLIN:             ${{ secrets.STUDENT_IDS_EARL_FRANKLIN }}
+
+          # Odisea Sports Management
+          AIRTABLE_DETAILED_TABLE_ODISEA: ${{ secrets.AIRTABLE_DETAILED_ODISEA_TABLE }}
+          AIRTABLE_SUMMARY_TABLE_ODISEA:  ${{ secrets.AIRTABLE_SUMMARY_ODISEA_TABLE }}
+          STUDENT_IDS_ODISEA:             ${{ secrets.STUDENT_IDS_ODISEA }}
         run: |
           set -euo pipefail
-          echo "CANVAS_API_URL=${CANVAS_API_URL}" >> "$GITHUB_ENV"
+          echo "CANVAS_API_URL=${CANVAS_API_URL}"      >> "$GITHUB_ENV"
           echo "CANVAS_ACCESS_TOKEN=${CANVAS_ACCESS_TOKEN}" >> "$GITHUB_ENV"
-          echo "AIRTABLE_API_KEY=${AIRTABLE_API_KEY}" >> "$GITHUB_ENV"
-          echo "AIRTABLE_BASE_ID=${AIRTABLE_BASE_ID}" >> "$GITHUB_ENV"
+          echo "AIRTABLE_API_KEY=${AIRTABLE_API_KEY}"  >> "$GITHUB_ENV"
+          echo "AIRTABLE_BASE_ID=${AIRTABLE_BASE_ID}"  >> "$GITHUB_ENV"
 
           case "${{ matrix.partner }}" in
             phoenix)
@@ -86,6 +128,42 @@ jobs:
               echo "STUDENT_USER_IDS=${STUDENT_IDS_SOUTHLANDS}"                    >> "$GITHUB_ENV"
               echo "PARTNER_NAME=Southlands"                                       >> "$GITHUB_ENV"
               ;;
+            nhcc_journey)
+              echo "AIRTABLE_DETAILED_TABLE=${AIRTABLE_DETAILED_TABLE_NHCC_JOURNEY}" >> "$GITHUB_ENV"
+              echo "AIRTABLE_SUMMARY_TABLE=${AIRTABLE_SUMMARY_TABLE_NHCC_JOURNEY}"   >> "$GITHUB_ENV"
+              echo "STUDENT_USER_IDS=${STUDENT_IDS_NHCC_JOURNEY}"                    >> "$GITHUB_ENV"
+              echo "PARTNER_NAME=NHCC Journey"                                       >> "$GITHUB_ENV"
+              ;;
+            nhcc_ironwood)
+              echo "AIRTABLE_DETAILED_TABLE=${AIRTABLE_DETAILED_TABLE_NHCC_IRONWOOD}" >> "$GITHUB_ENV"
+              echo "AIRTABLE_SUMMARY_TABLE=${AIRTABLE_SUMMARY_TABLE_NHCC_IRONWOOD}"   >> "$GITHUB_ENV"
+              echo "STUDENT_USER_IDS=${STUDENT_IDS_NHCC_IRONWOOD}"                    >> "$GITHUB_ENV"
+              echo "PARTNER_NAME=NHCC Ironwood"                                       >> "$GITHUB_ENV"
+              ;;
+            nhcc_central)
+              echo "AIRTABLE_DETAILED_TABLE=${AIRTABLE_DETAILED_TABLE_NHCC_CENTRAL}" >> "$GITHUB_ENV"
+              echo "AIRTABLE_SUMMARY_TABLE=${AIRTABLE_SUMMARY_TABLE_NHCC_CENTRAL}"   >> "$GITHUB_ENV"
+              echo "STUDENT_USER_IDS=${STUDENT_IDS_NHCC_CENTRAL}"                    >> "$GITHUB_ENV"
+              echo "PARTNER_NAME=NHCC Central"                                       >> "$GITHUB_ENV"
+              ;;
+            nhcc_grace)
+              echo "AIRTABLE_DETAILED_TABLE=${AIRTABLE_DETAILED_TABLE_NHCC_GRACE}" >> "$GITHUB_ENV"
+              echo "AIRTABLE_SUMMARY_TABLE=${AIRTABLE_SUMMARY_TABLE_NHCC_GRACE}"   >> "$GITHUB_ENV"
+              echo "STUDENT_USER_IDS=${STUDENT_IDS_NHCC_GRACE}"                    >> "$GITHUB_ENV"
+              echo "PARTNER_NAME=NHCC GRACE"                                        >> "$GITHUB_ENV"
+              ;;
+            earl_franklin)
+              echo "AIRTABLE_DETAILED_TABLE=${AIRTABLE_DETAILED_TABLE_EARL_FRANKLIN}" >> "$GITHUB_ENV"
+              echo "AIRTABLE_SUMMARY_TABLE=${AIRTABLE_SUMMARY_TABLE_EARL_FRANKLIN}"   >> "$GITHUB_ENV"
+              echo "STUDENT_USER_IDS=${STUDENT_IDS_EARL_FRANKLIN}"                    >> "$GITHUB_ENV"
+              echo "PARTNER_NAME=Earl Franklin"                                       >> "$GITHUB_ENV"
+              ;;
+            odisea)
+              echo "AIRTABLE_DETAILED_TABLE=${AIRTABLE_DETAILED_TABLE_ODISEA}" >> "$GITHUB_ENV"
+              echo "AIRTABLE_SUMMARY_TABLE=${AIRTABLE_SUMMARY_TABLE_ODISEA}"   >> "$GITHUB_ENV"
+              echo "STUDENT_USER_IDS=${STUDENT_IDS_ODISEA}"                    >> "$GITHUB_ENV"
+              echo "PARTNER_NAME=Odisea Sports Management"                      >> "$GITHUB_ENV"
+              ;;
             *)
               echo "::error ::Unknown partner '${{ matrix.partner }}'"; exit 1;;
           esac
@@ -105,7 +183,7 @@ jobs:
         env:
           DEBUG: "1"
           LOG_SCHEMA: "1"
-          ALLOW_SELECT_FALLBACK: "0"   # set to "1" only if you kept single-selects that may get new values
+          ALLOW_SELECT_FALLBACK: "0"
           SLEEP_BETWEEN_REQUESTS: "0.0"
           PYTHONUNBUFFERED: "1"
         run: |
