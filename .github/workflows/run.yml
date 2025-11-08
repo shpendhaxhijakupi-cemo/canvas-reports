@@ -6,12 +6,69 @@ on:
     - cron: '0 5 * * *'
 
 jobs:
-  # ================= Everything EXCEPT B2C (runs in parallel matrix) =================
+  # ================= B2C WIPE (quick, runs first) =================
+  b2c_wipe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install deps
+        run: |
+          pip install --upgrade pip
+          pip install pyairtable
+      - name: Wipe B2C Airtable tables
+        env:
+          AIRTABLE_API_KEY:     ${{ secrets.AIRTABLE_API_KEY }}
+          AIRTABLE_BASE_ID:     ${{ secrets.AIRTABLE_BASE_ID }}
+          # Use the same B2C tables you write to
+          AIRTABLE_DETAILED_TABLE_B2C: ${{ secrets.AIRTABLE_DETAILED_B2C_TABLE }}
+          AIRTABLE_SUMMARY_TABLE_B2C:  ${{ secrets.AIRTABLE_SUMMARY_B2C_TABLE }}
+        run: |
+          python - <<'PY'
+          import os, time
+          from pyairtable import Api
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+
+          api = Api(os.environ["AIRTABLE_API_KEY"])
+          base = os.environ["AIRTABLE_BASE_ID"]
+          det_name = os.environ["AIRTABLE_DETAILED_TABLE_B2C"]
+          sum_name = os.environ["AIRTABLE_SUMMARY_TABLE_B2C"]
+
+          def wipe(table, label):
+              ids=[]
+              # collect ids
+              for page in table.iterate(page_size=100):
+                  if isinstance(page, dict):
+                      rid = page.get("id")
+                      if rid: ids.append(rid)
+                  else:
+                      for rec in page:
+                          rid = rec.get("id"); 
+                          if rid: ids.append(rid)
+              if not ids:
+                  print(f"[WIPE] {label}: nothing to delete.")
+                  return
+              print(f"[WIPE] {label}: deleting {len(ids)} records…")
+              # delete in batches of 10, parallel
+              chunks=[ids[i:i+10] for i in range(0,len(ids),10)]
+              with ThreadPoolExecutor(max_workers=8) as ex:
+                  futs=[ex.submit(table.batch_delete, ch) for ch in chunks]
+                  for f in as_completed(futs):
+                      f.result()
+              print(f"[WIPE] {label}: complete.")
+
+          det = api.table(base, det_name)
+          summ = api.table(base, sum_name)
+          wipe(det, "B2C Detailed")
+          wipe(summ, "B2C Summary")
+          PY
+
+  # ========== Everything EXCEPT B2C (runs in parallel) ==========
   sync_rest:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
-      # No max-parallel here → runs partners in parallel
       matrix:
         partner:
           - phoenix
@@ -23,19 +80,14 @@ jobs:
           - nhcc_grace
           - earl_franklin
           - odisea
-
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
+        with: { python-version: '3.11' }
       - name: Install deps
         run: |
           pip install --upgrade pip
           pip install requests pyairtable
-
       - name: Prepare partner env
         shell: bash
         env:
@@ -44,47 +96,38 @@ jobs:
           AIRTABLE_API_KEY:     ${{ secrets.AIRTABLE_API_KEY }}
           AIRTABLE_BASE_ID:     ${{ secrets.AIRTABLE_BASE_ID }}
 
-          # Phoenix
           AIRTABLE_DETAILED_TABLE_PHOENIX: ${{ secrets.AIRTABLE_DETAILED_TABLE }}
           AIRTABLE_SUMMARY_TABLE_PHOENIX:  ${{ secrets.AIRTABLE_SUMMARY_TABLE }}
           STUDENT_IDS_PHOENIX:             ${{ secrets.STUDENT_IDS_PHOENIX }}
 
-          # NHCC (legacy, all-NHCC)
           AIRTABLE_DETAILED_TABLE_NHCC: ${{ secrets.AIRTABLE_DETAILED_NHCC_TABLE }}
           AIRTABLE_SUMMARY_TABLE_NHCC:  ${{ secrets.AIRTABLE_SUMMARY_NHCC_TABLE }}
           STUDENT_IDS_NHCC:             ${{ secrets.STUDENT_IDS_NHCC }}
 
-          # Southlands
           AIRTABLE_DETAILED_TABLE_SOUTHLANDS: ${{ secrets.AIRTABLE_DETAILED_SOUTHLANDS_TABLE }}
           AIRTABLE_SUMMARY_TABLE_SOUTHLANDS:  ${{ secrets.AIRTABLE_SUMMARY_SOUTHLANDS_TABLE }}
           STUDENT_IDS_SOUTHLANDS:             ${{ secrets.STUDENT_IDS_SOUTHLANDS }}
 
-          # NHCC Journey
           AIRTABLE_DETAILED_TABLE_NHCC_JOURNEY: ${{ secrets.AIRTABLE_DETAILED_NHCC_JOURNEY_TABLE }}
           AIRTABLE_SUMMARY_TABLE_NHCC_JOURNEY:  ${{ secrets.AIRTABLE_SUMMARY_NHCC_JOURNEY_TABLE }}
           STUDENT_IDS_NHCC_JOURNEY:             ${{ secrets.STUDENT_IDS_NHCC_JOURNEY }}
 
-          # NHCC Ironwood
           AIRTABLE_DETAILED_TABLE_NHCC_IRONWOOD: ${{ secrets.AIRTABLE_DETAILED_NHCC_IRONWOOD_TABLE }}
           AIRTABLE_SUMMARY_TABLE_NHCC_IRONWOOD:  ${{ secrets.AIRTABLE_SUMMARY_NHCC_IRONWOOD_TABLE }}
           STUDENT_IDS_NHCC_IRONWOOD:             ${{ secrets.STUDENT_IDS_NHCC_IRONWOOD }}
 
-          # NHCC Central
           AIRTABLE_DETAILED_TABLE_NHCC_CENTRAL: ${{ secrets.AIRTABLE_DETAILED_NHCC_CENTRAL_TABLE }}
           AIRTABLE_SUMMARY_TABLE_NHCC_CENTRAL:  ${{ secrets.AIRTABLE_SUMMARY_NHCC_CENTRAL_TABLE }}
           STUDENT_IDS_NHCC_CENTRAL:             ${{ secrets.STUDENT_IDS_NHCC_CENTRAL }}
 
-          # NHCC Grace
           AIRTABLE_DETAILED_TABLE_NHCC_GRACE: ${{ secrets.AIRTABLE_DETAILED_NHCC_GRACE_TABLE }}
           AIRTABLE_SUMMARY_TABLE_NHCC_GRACE:  ${{ secrets.AIRTABLE_SUMMARY_NHCC_GRACE_TABLE }}
           STUDENT_IDS_NHCC_GRACE:             ${{ secrets.STUDENT_IDS_NHCC_GRACE }}
 
-          # Earl Franklin
           AIRTABLE_DETAILED_TABLE_EARL_FRANKLIN: ${{ secrets.AIRTABLE_DETAILED_EARL_FRANKLIN_TABLE }}
           AIRTABLE_SUMMARY_TABLE_EARL_FRANKLIN:  ${{ secrets.AIRTABLE_SUMMARY_EARL_FRANKLIN_TABLE }}
           STUDENT_IDS_EARL_FRANKLIN:             ${{ secrets.STUDENT_IDS_EARL_FRANKLIN }}
 
-          # Odisea
           AIRTABLE_DETAILED_TABLE_ODISEA: ${{ secrets.AIRTABLE_DETAILED_ODISEA_TABLE }}
           AIRTABLE_SUMMARY_TABLE_ODISEA:  ${{ secrets.AIRTABLE_SUMMARY_ODISEA_TABLE }}
           STUDENT_IDS_ODISEA:             ${{ secrets.STUDENT_IDS_ODISEA }}
@@ -151,14 +194,12 @@ jobs:
               echo "PARTNER_NAME=Odisea"                                       >> "$GITHUB_ENV"
               ;;
           esac
-
       - name: Validate env
         shell: bash
         run: |
           test -n "${AIRTABLE_DETAILED_TABLE}" || { echo "::error ::AIRTABLE_DETAILED_TABLE empty"; exit 1; }
           test -n "${AIRTABLE_SUMMARY_TABLE}"  || { echo "::error ::AIRTABLE_SUMMARY_TABLE empty";  exit 1; }
           test -n "${STUDENT_USER_IDS}"        || { echo "::error ::STUDENT_USER_IDS empty";        exit 1; }
-
       - name: Run sync
         env:
           DEBUG: "1"
@@ -168,22 +209,18 @@ jobs:
           PYTHONUNBUFFERED: "1"
         run: python canvas_to_airtable.py
 
-  # ================= B2C Part 1 (wipes) =================
+  # ================= B2C P1 (append; starts after wipe) =================
   b2c_p1:
     runs-on: ubuntu-latest
-    # No 'needs' → runs in parallel with sync_rest
+    needs: [b2c_wipe]    # start right after wipe
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
+        with: { python-version: '3.11' }
       - name: Install deps
         run: |
           pip install --upgrade pip
           pip install requests pyairtable
-
       - name: Prepare env (B2C_P1)
         shell: bash
         env:
@@ -204,14 +241,13 @@ jobs:
           echo "AIRTABLE_SUMMARY_TABLE=${AIRTABLE_SUMMARY_TABLE_B2C}"   >> "$GITHUB_ENV"
           echo "STUDENT_USER_IDS=${STUDENT_IDS_B2C_P1}"                 >> "$GITHUB_ENV"
           echo "PARTNER_NAME=B2C_P1"                                    >> "$GITHUB_ENV"
-
+          echo "SKIP_WIPE=1"                                            >> "$GITHUB_ENV"   # ← skip; wipe already done
       - name: Validate env
         shell: bash
         run: |
           test -n "${AIRTABLE_DETAILED_TABLE}" || { echo "::error ::AIRTABLE_DETAILED_TABLE empty"; exit 1; }
           test -n "${AIRTABLE_SUMMARY_TABLE}"  || { echo "::error ::AIRTABLE_SUMMARY_TABLE empty";  exit 1; }
           test -n "${STUDENT_USER_IDS}"        || { echo "::error ::STUDENT_USER_IDS empty";        exit 1; }
-
       - name: Run B2C_P1
         env:
           DEBUG: "1"
@@ -221,22 +257,18 @@ jobs:
           PYTHONUNBUFFERED: "1"
         run: python canvas_to_airtable.py
 
-  # ================= B2C Part 2 (append only; waits for P1) =================
+  # ================= B2C P2 (append; starts after wipe) =================
   b2c_p2:
     runs-on: ubuntu-latest
-    needs: [b2c_p1]   # enforce order ONLY for B2C
+    needs: [b2c_wipe]    # start right after wipe (in parallel with P1)
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
+        with: { python-version: '3.11' }
       - name: Install deps
         run: |
           pip install --upgrade pip
           pip install requests pyairtable
-
       - name: Prepare env (B2C_P2)
         shell: bash
         env:
@@ -257,14 +289,13 @@ jobs:
           echo "AIRTABLE_SUMMARY_TABLE=${AIRTABLE_SUMMARY_TABLE_B2C}"   >> "$GITHUB_ENV"
           echo "STUDENT_USER_IDS=${STUDENT_IDS_B2C_P2}"                 >> "$GITHUB_ENV"
           echo "PARTNER_NAME=B2C_P2"                                    >> "$GITHUB_ENV"
-
+          echo "SKIP_WIPE=1"                                            >> "$GITHUB_ENV"   # ← skip; wipe already done
       - name: Validate env
         shell: bash
         run: |
           test -n "${AIRTABLE_DETAILED_TABLE}" || { echo "::error ::AIRTABLE_DETAILED_TABLE empty"; exit 1; }
           test -n "${AIRTABLE_SUMMARY_TABLE}"  || { echo "::error ::AIRTABLE_SUMMARY_TABLE empty";  exit 1; }
           test -n "${STUDENT_USER_IDS}"        || { echo "::error ::STUDENT_USER_IDS empty";        exit 1; }
-
       - name: Run B2C_P2
         env:
           DEBUG: "1"
