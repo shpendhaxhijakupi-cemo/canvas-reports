@@ -6,18 +6,16 @@ on:
     - cron: '0 5 * * *'
 
 jobs:
-  sync:
+  # ================= Everything EXCEPT B2C (runs in parallel matrix) =================
+  sync_rest:
     runs-on: ubuntu-latest
-
     strategy:
       fail-fast: false
-      max-parallel: 1   # ← ensures b2c_p1 finishes before b2c_p2 (no race after wipe)
+      # No max-parallel here → runs partners in parallel
       matrix:
         partner:
           - phoenix
           - nhcc
-          - b2c_p1     # 1st run (wipe enabled in .py)
-          - b2c_p2     # 2nd run (skip wipe in .py)
           - southlands
           - nhcc_journey
           - nhcc_ironwood
@@ -51,16 +49,10 @@ jobs:
           AIRTABLE_SUMMARY_TABLE_PHOENIX:  ${{ secrets.AIRTABLE_SUMMARY_TABLE }}
           STUDENT_IDS_PHOENIX:             ${{ secrets.STUDENT_IDS_PHOENIX }}
 
-          # NHCC
+          # NHCC (legacy, all-NHCC)
           AIRTABLE_DETAILED_TABLE_NHCC: ${{ secrets.AIRTABLE_DETAILED_NHCC_TABLE }}
           AIRTABLE_SUMMARY_TABLE_NHCC:  ${{ secrets.AIRTABLE_SUMMARY_NHCC_TABLE }}
           STUDENT_IDS_NHCC:             ${{ secrets.STUDENT_IDS_NHCC }}
-
-          # B2C (split into 2)
-          AIRTABLE_DETAILED_TABLE_B2C: ${{ secrets.AIRTABLE_DETAILED_B2C_TABLE }}
-          AIRTABLE_SUMMARY_TABLE_B2C:  ${{ secrets.AIRTABLE_SUMMARY_B2C_TABLE }}
-          STUDENT_IDS_B2C_P1:          ${{ secrets.STUDENT_IDS_B2C_P1 }}
-          STUDENT_IDS_B2C_P2:          ${{ secrets.STUDENT_IDS_B2C_P2 }}
 
           # Southlands
           AIRTABLE_DETAILED_TABLE_SOUTHLANDS: ${{ secrets.AIRTABLE_DETAILED_SOUTHLANDS_TABLE }}
@@ -96,13 +88,12 @@ jobs:
           AIRTABLE_DETAILED_TABLE_ODISEA: ${{ secrets.AIRTABLE_DETAILED_ODISEA_TABLE }}
           AIRTABLE_SUMMARY_TABLE_ODISEA:  ${{ secrets.AIRTABLE_SUMMARY_ODISEA_TABLE }}
           STUDENT_IDS_ODISEA:             ${{ secrets.STUDENT_IDS_ODISEA }}
-
         run: |
           set -euo pipefail
-          echo "CANVAS_API_URL=${CANVAS_API_URL}"      >> "$GITHUB_ENV"
+          echo "CANVAS_API_URL=${CANVAS_API_URL}"           >> "$GITHUB_ENV"
           echo "CANVAS_ACCESS_TOKEN=${CANVAS_ACCESS_TOKEN}" >> "$GITHUB_ENV"
-          echo "AIRTABLE_API_KEY=${AIRTABLE_API_KEY}"  >> "$GITHUB_ENV"
-          echo "AIRTABLE_BASE_ID=${AIRTABLE_BASE_ID}"  >> "$GITHUB_ENV"
+          echo "AIRTABLE_API_KEY=${AIRTABLE_API_KEY}"       >> "$GITHUB_ENV"
+          echo "AIRTABLE_BASE_ID=${AIRTABLE_BASE_ID}"       >> "$GITHUB_ENV"
 
           case "${{ matrix.partner }}" in
             phoenix)
@@ -116,18 +107,6 @@ jobs:
               echo "AIRTABLE_SUMMARY_TABLE=${AIRTABLE_SUMMARY_TABLE_NHCC}"   >> "$GITHUB_ENV"
               echo "STUDENT_USER_IDS=${STUDENT_IDS_NHCC}"                    >> "$GITHUB_ENV"
               echo "PARTNER_NAME=NHCC"                                       >> "$GITHUB_ENV"
-              ;;
-            b2c_p1)
-              echo "AIRTABLE_DETAILED_TABLE=${AIRTABLE_DETAILED_TABLE_B2C}" >> "$GITHUB_ENV"
-              echo "AIRTABLE_SUMMARY_TABLE=${AIRTABLE_SUMMARY_TABLE_B2C}"   >> "$GITHUB_ENV"
-              echo "STUDENT_USER_IDS=${STUDENT_IDS_B2C_P1}"                 >> "$GITHUB_ENV"
-              echo "PARTNER_NAME=B2C_P1"                                    >> "$GITHUB_ENV"
-              ;;
-            b2c_p2)
-              echo "AIRTABLE_DETAILED_TABLE=${AIRTABLE_DETAILED_TABLE_B2C}" >> "$GITHUB_ENV"
-              echo "AIRTABLE_SUMMARY_TABLE=${AIRTABLE_SUMMARY_TABLE_B2C}"   >> "$GITHUB_ENV"
-              echo "STUDENT_USER_IDS=${STUDENT_IDS_B2C_P2}"                 >> "$GITHUB_ENV"
-              echo "PARTNER_NAME=B2C_P2"                                    >> "$GITHUB_ENV"
               ;;
             southlands)
               echo "AIRTABLE_DETAILED_TABLE=${AIRTABLE_DETAILED_TABLE_SOUTHLANDS}" >> "$GITHUB_ENV"
@@ -180,12 +159,117 @@ jobs:
           test -n "${AIRTABLE_SUMMARY_TABLE}"  || { echo "::error ::AIRTABLE_SUMMARY_TABLE empty";  exit 1; }
           test -n "${STUDENT_USER_IDS}"        || { echo "::error ::STUDENT_USER_IDS empty";        exit 1; }
 
-      - name: Run sync for ${{ matrix.partner }}
+      - name: Run sync
         env:
           DEBUG: "1"
           LOG_SCHEMA: "1"
           ALLOW_SELECT_FALLBACK: "0"
           SLEEP_BETWEEN_REQUESTS: "0.0"
           PYTHONUNBUFFERED: "1"
+        run: python canvas_to_airtable.py
+
+  # ================= B2C Part 1 (wipes) =================
+  b2c_p1:
+    runs-on: ubuntu-latest
+    # No 'needs' → runs in parallel with sync_rest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
         run: |
-          python canvas_to_airtable.py
+          pip install --upgrade pip
+          pip install requests pyairtable
+
+      - name: Prepare env (B2C_P1)
+        shell: bash
+        env:
+          CANVAS_API_URL:       ${{ secrets.CANVAS_API_URL }}
+          CANVAS_ACCESS_TOKEN:  ${{ secrets.CANVAS_ACCESS_TOKEN }}
+          AIRTABLE_API_KEY:     ${{ secrets.AIRTABLE_API_KEY }}
+          AIRTABLE_BASE_ID:     ${{ secrets.AIRTABLE_BASE_ID }}
+          AIRTABLE_DETAILED_TABLE_B2C: ${{ secrets.AIRTABLE_DETAILED_B2C_TABLE }}
+          AIRTABLE_SUMMARY_TABLE_B2C:  ${{ secrets.AIRTABLE_SUMMARY_B2C_TABLE }}
+          STUDENT_IDS_B2C_P1:          ${{ secrets.STUDENT_IDS_B2C_P1 }}
+        run: |
+          set -euo pipefail
+          echo "CANVAS_API_URL=${CANVAS_API_URL}"           >> "$GITHUB_ENV"
+          echo "CANVAS_ACCESS_TOKEN=${CANVAS_ACCESS_TOKEN}" >> "$GITHUB_ENV"
+          echo "AIRTABLE_API_KEY=${AIRTABLE_API_KEY}"       >> "$GITHUB_ENV"
+          echo "AIRTABLE_BASE_ID=${AIRTABLE_BASE_ID}"       >> "$GITHUB_ENV"
+          echo "AIRTABLE_DETAILED_TABLE=${AIRTABLE_DETAILED_TABLE_B2C}" >> "$GITHUB_ENV"
+          echo "AIRTABLE_SUMMARY_TABLE=${AIRTABLE_SUMMARY_TABLE_B2C}"   >> "$GITHUB_ENV"
+          echo "STUDENT_USER_IDS=${STUDENT_IDS_B2C_P1}"                 >> "$GITHUB_ENV"
+          echo "PARTNER_NAME=B2C_P1"                                    >> "$GITHUB_ENV"
+
+      - name: Validate env
+        shell: bash
+        run: |
+          test -n "${AIRTABLE_DETAILED_TABLE}" || { echo "::error ::AIRTABLE_DETAILED_TABLE empty"; exit 1; }
+          test -n "${AIRTABLE_SUMMARY_TABLE}"  || { echo "::error ::AIRTABLE_SUMMARY_TABLE empty";  exit 1; }
+          test -n "${STUDENT_USER_IDS}"        || { echo "::error ::STUDENT_USER_IDS empty";        exit 1; }
+
+      - name: Run B2C_P1
+        env:
+          DEBUG: "1"
+          LOG_SCHEMA: "1"
+          ALLOW_SELECT_FALLBACK: "0"
+          SLEEP_BETWEEN_REQUESTS: "0.0"
+          PYTHONUNBUFFERED: "1"
+        run: python canvas_to_airtable.py
+
+  # ================= B2C Part 2 (append only; waits for P1) =================
+  b2c_p2:
+    runs-on: ubuntu-latest
+    needs: [b2c_p1]   # enforce order ONLY for B2C
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: |
+          pip install --upgrade pip
+          pip install requests pyairtable
+
+      - name: Prepare env (B2C_P2)
+        shell: bash
+        env:
+          CANVAS_API_URL:       ${{ secrets.CANVAS_API_URL }}
+          CANVAS_ACCESS_TOKEN:  ${{ secrets.CANVAS_ACCESS_TOKEN }}
+          AIRTABLE_API_KEY:     ${{ secrets.AIRTABLE_API_KEY }}
+          AIRTABLE_BASE_ID:     ${{ secrets.AIRTABLE_BASE_ID }}
+          AIRTABLE_DETAILED_TABLE_B2C: ${{ secrets.AIRTABLE_DETAILED_B2C_TABLE }}
+          AIRTABLE_SUMMARY_TABLE_B2C:  ${{ secrets.AIRTABLE_SUMMARY_B2C_TABLE }}
+          STUDENT_IDS_B2C_P2:          ${{ secrets.STUDENT_IDS_B2C_P2 }}
+        run: |
+          set -euo pipefail
+          echo "CANVAS_API_URL=${CANVAS_API_URL}"           >> "$GITHUB_ENV"
+          echo "CANVAS_ACCESS_TOKEN=${CANVAS_ACCESS_TOKEN}" >> "$GITHUB_ENV"
+          echo "AIRTABLE_API_KEY=${AIRTABLE_API_KEY}"       >> "$GITHUB_ENV"
+          echo "AIRTABLE_BASE_ID=${AIRTABLE_BASE_ID}"       >> "$GITHUB_ENV"
+          echo "AIRTABLE_DETAILED_TABLE=${AIRTABLE_DETAILED_TABLE_B2C}" >> "$GITHUB_ENV"
+          echo "AIRTABLE_SUMMARY_TABLE=${AIRTABLE_SUMMARY_TABLE_B2C}"   >> "$GITHUB_ENV"
+          echo "STUDENT_USER_IDS=${STUDENT_IDS_B2C_P2}"                 >> "$GITHUB_ENV"
+          echo "PARTNER_NAME=B2C_P2"                                    >> "$GITHUB_ENV"
+
+      - name: Validate env
+        shell: bash
+        run: |
+          test -n "${AIRTABLE_DETAILED_TABLE}" || { echo "::error ::AIRTABLE_DETAILED_TABLE empty"; exit 1; }
+          test -n "${AIRTABLE_SUMMARY_TABLE}"  || { echo "::error ::AIRTABLE_SUMMARY_TABLE empty";  exit 1; }
+          test -n "${STUDENT_USER_IDS}"        || { echo "::error ::STUDENT_USER_IDS empty";        exit 1; }
+
+      - name: Run B2C_P2
+        env:
+          DEBUG: "1"
+          LOG_SCHEMA: "1"
+          ALLOW_SELECT_FALLBACK: "0"
+          SLEEP_BETWEEN_REQUESTS: "0.0"
+          PYTHONUNBUFFERED: "1"
+        run: python canvas_to_airtable.py
