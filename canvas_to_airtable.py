@@ -2,7 +2,7 @@ import os
 import time
 import requests
 import traceback
-import re  # ← added
+import re  # ← already present
 from typing import Dict, List, Tuple, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pyairtable import Api
@@ -31,14 +31,23 @@ SHOW_FETCH_ASSIGNMENTS = True
 SHOW_FETCH_SUBMISSIONS = True
 ENABLE_AIRTABLE_WRITE_PROBE = False
 
-# === HARD-CODED: always wipe tables first ===
+# === HARD-CODED: always wipe tables first (kept ON) ===
 WIPE_TABLES_FIRST = True
 FAST_WIPE_WORKERS = int(os.environ.get("FAST_WIPE_WORKERS", "8"))   # parallel delete threads
 FAST_WIPE_PAGE_SIZE = int(os.environ.get("FAST_WIPE_PAGE_SIZE", "100"))
 AIRTABLE_RPS = float(os.environ.get("AIRTABLE_RPS", "10"))          # crude throttle (requests/sec)
 
+# Partition/job label passed from workflow (e.g., "B2C_P1" / "B2C_P2")
+PARTNER_NAME = os.environ.get("PARTNER_NAME", "").strip()
+
 # Student IDs from env (comma/space/newline separated)
 STUDENT_USER_IDS_RAW = os.environ.get("STUDENT_USER_IDS", "")
+
+# If not provided, allow split secrets by partition name (B2C_P1 / B2C_P2)
+if not STUDENT_USER_IDS_RAW and PARTNER_NAME.upper().endswith("_P1"):
+    STUDENT_USER_IDS_RAW = os.environ.get("STUDENT_IDS_B2C_P1", "").strip()
+elif not STUDENT_USER_IDS_RAW and PARTNER_NAME.upper().endswith("_P2"):
+    STUDENT_USER_IDS_RAW = os.environ.get("STUDENT_IDS_B2C_P2", "").strip()
 
 # Skip these assignment titles (exact match, lowercased elsewhere)
 SKIP_EXACT_TITLES = {"end of unit feedback", "quarterly feedback"}
@@ -61,6 +70,13 @@ def _is_excluded_course(name: Optional[str]) -> bool:
 def p(msg: str): print(msg, flush=True)
 def dbg(msg: str):
     if DEBUG: p(f"[DEBUG] {msg}")
+
+def _preview_ids(ids: List[str], n: int = 3) -> str:
+    if not ids:
+        return "[]"
+    if len(ids) <= n * 2:
+        return str(ids)
+    return f"{ids[:n]} ... {ids[-n:]}"
 
 # ==============================
 # Airtable setup
@@ -428,7 +444,7 @@ def wipe_table_fast(table, label: str):
 # CRUD helpers (writes)
 # ==============================
 def airtable_insert_detailed(rows: List[dict]):
-    p(f"[INFO] Inserting {len(rows)} detailed rows")
+    p(f"[INFO] Inserting {len(rows)} detailed rows}")
     if not rows:
         return
     for i, chunk in enumerate(_chunks(rows, 10), start=1):
@@ -473,15 +489,22 @@ def main():
 
     user_ids = _parse_student_ids_from_env(STUDENT_USER_IDS_RAW)
     if user_ids:
-        p(f"[INFO] Using STUDENT_USER_IDS from env: {user_ids[:10]}{'...' if len(user_ids)>10 else ''}")
+        p(f"[INFO] PARTNER_NAME='{PARTNER_NAME}' → using {len(user_ids)} student IDs")
+        try:
+            p(f"[INFO] ID preview: {_preview_ids(user_ids)}")
+        except Exception:
+            pass
     else:
         p("[INFO] No STUDENT_USER_IDS provided; nothing to do.")
         return
 
-    # ALWAYS WIPE FIRST
-    p("[WIPE] Wiping both Airtable tables before writing (hard-coded).")
-    wipe_table_fast(tbl_detailed, "Detailed table")
-    wipe_table_fast(tbl_summary,  "Summary table")
+    # ALWAYS WIPE FIRST (hard-coded), except when this is the second partition pass (…_P2)
+    if PARTNER_NAME.upper().endswith("_P2"):
+        p("[WIPE] Skipped (second partition run detected: PARTNER_NAME ends with _P2).")
+    else:
+        p("[WIPE] Wiping both Airtable tables before writing (hard-coded).")
+        wipe_table_fast(tbl_detailed, "Detailed table")
+        wipe_table_fast(tbl_summary,  "Summary table")
 
     stats = {"processed": 0, "skipped": 0}
     p("[INFO] Skipping global terms lookup; using course.term.name from Canvas.")
