@@ -2,7 +2,7 @@ import os
 import time
 import requests
 import traceback
-import re  # ← already present
+import re
 from typing import Dict, List, Tuple, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pyairtable import Api
@@ -444,7 +444,7 @@ def wipe_table_fast(table, label: str):
 # CRUD helpers (writes)
 # ==============================
 def airtable_insert_detailed(rows: List[dict]):
-    p(f"[INFO] Inserting {len(rows)} detailed rows}")
+    p(f"[INFO] Inserting {len(rows)} detailed rows")
     if not rows:
         return
     for i, chunk in enumerate(_chunks(rows, 10), start=1):
