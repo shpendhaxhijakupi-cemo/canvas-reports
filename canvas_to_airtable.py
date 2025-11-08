@@ -31,19 +31,19 @@ SHOW_FETCH_ASSIGNMENTS = True
 SHOW_FETCH_SUBMISSIONS = True
 ENABLE_AIRTABLE_WRITE_PROBE = False
 
-# === HARD-CODED: always wipe tables first (kept ON) ===
+# === HARD-CODED: wipe tables first by default ===
 WIPE_TABLES_FIRST = True
 FAST_WIPE_WORKERS = int(os.environ.get("FAST_WIPE_WORKERS", "8"))   # parallel delete threads
 FAST_WIPE_PAGE_SIZE = int(os.environ.get("FAST_WIPE_PAGE_SIZE", "100"))
 AIRTABLE_RPS = float(os.environ.get("AIRTABLE_RPS", "10"))          # crude throttle (requests/sec)
 
-# Partition/job label passed from workflow (e.g., "B2C_P1" / "B2C_P2")
+# Partition/job label from workflow (e.g., "B2C_P1" / "B2C_P2" / "Phoenix" ...)
 PARTNER_NAME = os.environ.get("PARTNER_NAME", "").strip()
 
 # Student IDs from env (comma/space/newline separated)
 STUDENT_USER_IDS_RAW = os.environ.get("STUDENT_USER_IDS", "")
 
-# If not provided, allow split secrets by partition name (B2C_P1 / B2C_P2)
+# Allow split via env by partition name (B2C_P1 / B2C_P2) if STUDENT_USER_IDS not set directly
 if not STUDENT_USER_IDS_RAW and PARTNER_NAME.upper().endswith("_P1"):
     STUDENT_USER_IDS_RAW = os.environ.get("STUDENT_IDS_B2C_P1", "").strip()
 elif not STUDENT_USER_IDS_RAW and PARTNER_NAME.upper().endswith("_P2"):
@@ -498,9 +498,10 @@ def main():
         p("[INFO] No STUDENT_USER_IDS provided; nothing to do.")
         return
 
-    # ALWAYS WIPE FIRST (hard-coded), except when this is the second partition pass (…_P2)
-    if PARTNER_NAME.upper().endswith("_P2"):
-        p("[WIPE] Skipped (second partition run detected: PARTNER_NAME ends with _P2).")
+    # ALWAYS WIPE FIRST (hard-coded) unless explicitly told to skip (for parallel partitions)
+    SKIP_WIPE = os.environ.get("SKIP_WIPE", "0") == "1"
+    if PARTNER_NAME.upper().endswith("_P2") or SKIP_WIPE:
+        p("[WIPE] Skipped (either _P2 partition or SKIP_WIPE=1).")
     else:
         p("[WIPE] Wiping both Airtable tables before writing (hard-coded).")
         wipe_table_fast(tbl_detailed, "Detailed table")
@@ -526,10 +527,10 @@ def main():
                     continue
                 seen_courses.add(cid)
 
-                # ✅ Prefer official course name; fall back to student's nickname only if needed
+                # Prefer official course name; fall back to student's nickname only if needed
                 course_name = course.get("original_name") or course.get("name") or f"Course {cid}"
 
-                # ⛔ Exclude configured courses
+                # Exclude configured courses
                 if _is_excluded_course(course_name):
                     p(f"[SKIP COURSE] Excluding course '{course_name}' (id {cid})")
                     continue
