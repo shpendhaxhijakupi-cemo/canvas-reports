@@ -11,12 +11,13 @@ jobs:
 
     strategy:
       fail-fast: false
+      max-parallel: 1   # ← ensures b2c_p1 finishes before b2c_p2 (no race after wipe)
       matrix:
         partner:
           - phoenix
           - nhcc
-          - b2c_p1     # 1st run (wipe enabled)
-          - b2c_p2     # 2nd run (skip wipe)
+          - b2c_p1     # 1st run (wipe enabled in .py)
+          - b2c_p2     # 2nd run (skip wipe in .py)
           - southlands
           - nhcc_journey
           - nhcc_ironwood
@@ -55,7 +56,7 @@ jobs:
           AIRTABLE_SUMMARY_TABLE_NHCC:  ${{ secrets.AIRTABLE_SUMMARY_NHCC_TABLE }}
           STUDENT_IDS_NHCC:             ${{ secrets.STUDENT_IDS_NHCC }}
 
-          # B2C (SPLIT INTO 2)
+          # B2C (split into 2)
           AIRTABLE_DETAILED_TABLE_B2C: ${{ secrets.AIRTABLE_DETAILED_B2C_TABLE }}
           AIRTABLE_SUMMARY_TABLE_B2C:  ${{ secrets.AIRTABLE_SUMMARY_B2C_TABLE }}
           STUDENT_IDS_B2C_P1:          ${{ secrets.STUDENT_IDS_B2C_P1 }}
@@ -98,7 +99,6 @@ jobs:
 
         run: |
           set -euo pipefail
-
           echo "CANVAS_API_URL=${CANVAS_API_URL}"      >> "$GITHUB_ENV"
           echo "CANVAS_ACCESS_TOKEN=${CANVAS_ACCESS_TOKEN}" >> "$GITHUB_ENV"
           echo "AIRTABLE_API_KEY=${AIRTABLE_API_KEY}"  >> "$GITHUB_ENV"
@@ -111,70 +111,60 @@ jobs:
               echo "STUDENT_USER_IDS=${STUDENT_IDS_PHOENIX}"                    >> "$GITHUB_ENV"
               echo "PARTNER_NAME=Phoenix"                                       >> "$GITHUB_ENV"
               ;;
-
             nhcc)
               echo "AIRTABLE_DETAILED_TABLE=${AIRTABLE_DETAILED_TABLE_NHCC}" >> "$GITHUB_ENV"
               echo "AIRTABLE_SUMMARY_TABLE=${AIRTABLE_SUMMARY_TABLE_NHCC}"   >> "$GITHUB_ENV"
               echo "STUDENT_USER_IDS=${STUDENT_IDS_NHCC}"                    >> "$GITHUB_ENV"
               echo "PARTNER_NAME=NHCC"                                       >> "$GITHUB_ENV"
               ;;
-
             b2c_p1)
               echo "AIRTABLE_DETAILED_TABLE=${AIRTABLE_DETAILED_TABLE_B2C}" >> "$GITHUB_ENV"
               echo "AIRTABLE_SUMMARY_TABLE=${AIRTABLE_SUMMARY_TABLE_B2C}"   >> "$GITHUB_ENV"
               echo "STUDENT_USER_IDS=${STUDENT_IDS_B2C_P1}"                 >> "$GITHUB_ENV"
               echo "PARTNER_NAME=B2C_P1"                                    >> "$GITHUB_ENV"
               ;;
-
             b2c_p2)
               echo "AIRTABLE_DETAILED_TABLE=${AIRTABLE_DETAILED_TABLE_B2C}" >> "$GITHUB_ENV"
               echo "AIRTABLE_SUMMARY_TABLE=${AIRTABLE_SUMMARY_TABLE_B2C}"   >> "$GITHUB_ENV"
               echo "STUDENT_USER_IDS=${STUDENT_IDS_B2C_P2}"                 >> "$GITHUB_ENV"
               echo "PARTNER_NAME=B2C_P2"                                    >> "$GITHUB_ENV"
               ;;
-
             southlands)
               echo "AIRTABLE_DETAILED_TABLE=${AIRTABLE_DETAILED_TABLE_SOUTHLANDS}" >> "$GITHUB_ENV"
               echo "AIRTABLE_SUMMARY_TABLE=${AIRTABLE_SUMMARY_TABLE_SOUTHLANDS}"   >> "$GITHUB_ENV"
               echo "STUDENT_USER_IDS=${STUDENT_IDS_SOUTHLANDS}"                    >> "$GITHUB_ENV"
               echo "PARTNER_NAME=Southlands"                                       >> "$GITHUB_ENV"
               ;;
-
             nhcc_journey)
               echo "AIRTABLE_DETAILED_TABLE=${AIRTABLE_DETAILED_TABLE_NHCC_JOURNEY}" >> "$GITHUB_ENV"
               echo "AIRTABLE_SUMMARY_TABLE=${AIRTABLE_SUMMARY_TABLE_NHCC_JOURNEY}"   >> "$GITHUB_ENV"
               echo "STUDENT_USER_IDS=${STUDENT_IDS_NHCC_JOURNEY}"                    >> "$GITHUB_ENV"
               echo "PARTNER_NAME=NHCC_Journey"                                       >> "$GITHUB_ENV"
               ;;
-
             nhcc_ironwood)
               echo "AIRTABLE_DETAILED_TABLE=${AIRTABLE_DETAILED_TABLE_NHCC_IRONWOOD}" >> "$GITHUB_ENV"
               echo "AIRTABLE_SUMMARY_TABLE=${AIRTABLE_SUMMARY_TABLE_NHCC_IRONWOOD}"   >> "$GITHUB_ENV"
               echo "STUDENT_USER_IDS=${STUDENT_IDS_NHCC_IRONWOOD}"                    >> "$GITHUB_ENV"
               echo "PARTNER_NAME=NHCC_Ironwood"                                       >> "$GITHUB_ENV"
               ;;
-
             nhcc_central)
               echo "AIRTABLE_DETAILED_TABLE=${AIRTABLE_DETAILED_TABLE_NHCC_CENTRAL}" >> "$GITHUB_ENV"
               echo "AIRTABLE_SUMMARY_TABLE=${AIRTABLE_SUMMARY_TABLE_NHCC_CENTRAL}"   >> "$GITHUB_ENV"
               echo "STUDENT_USER_IDS=${STUDENT_IDS_NHCC_CENTRAL}"                    >> "$GITHUB_ENV"
               echo "PARTNER_NAME=NHCC_Central"                                       >> "$GITHUB_ENV"
               ;;
-
             nhcc_grace)
               echo "AIRTABLE_DETAILED_TABLE=${AIRTABLE_DETAILED_TABLE_NHCC_GRACE}" >> "$GITHUB_ENV"
               echo "AIRTABLE_SUMMARY_TABLE=${AIRTABLE_SUMMARY_TABLE_NHCC_GRACE}"   >> "$GITHUB_ENV"
               echo "STUDENT_USER_IDS=${STUDENT_IDS_NHCC_GRACE}"                    >> "$GITHUB_ENV"
               echo "PARTNER_NAME=NHCC_Grace"                                        >> "$GITHUB_ENV"
               ;;
-
             earl_franklin)
               echo "AIRTABLE_DETAILED_TABLE=${AIRTABLE_DETAILED_TABLE_EARL_FRANKLIN}" >> "$GITHUB_ENV"
               echo "AIRTABLE_SUMMARY_TABLE=${AIRTABLE_SUMMARY_TABLE_EARL_FRANKLIN}"   >> "$GITHUB_ENV"
               echo "STUDENT_USER_IDS=${STUDENT_IDS_EARL_FRANKLIN}"                    >> "$GITHUB_ENV"
               echo "PARTNER_NAME=Earl_Franklin"                                       >> "$GITHUB_ENV"
               ;;
-
             odisea)
               echo "AIRTABLE_DETAILED_TABLE=${AIRTABLE_DETAILED_TABLE_ODISEA}" >> "$GITHUB_ENV"
               echo "AIRTABLE_SUMMARY_TABLE=${AIRTABLE_SUMMARY_TABLE_ODISEA}"   >> "$GITHUB_ENV"
